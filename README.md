@@ -120,6 +120,15 @@ python3 dealfindr.py "apple thunderbolt 2 cable"
 
 > On Windows use `python` instead of `python3`.
 
+### Interactive mode
+
+Run without a query, or use `--interactive`, to pick your sources and cities from prompts.
+
+```bash
+python3 dealfindr.py
+python3 dealfindr.py --interactive
+```
+
 ### Multi-word queries (no quotes needed)
 
 ```bash
@@ -163,16 +172,18 @@ python3 dealfindr.py "iphone 15 pro" --export results.csv
 ### All options
 
 ```
-usage: dealfindr [-h] [--source {amazon,bestbuy,craigslist,ebay,google,walmart} [{amazon,bestbuy,craigslist,ebay,google,walmart} ...]]
+usage: dealfindr [-h] [--interactive]
+                 [--source {amazon,bestbuy,craigslist,ebay,google,walmart} [{amazon,bestbuy,craigslist,ebay,google,walmart} ...]]
                  [--no-ebay] [--no-amazon] [--no-craigslist]
                  [--no-walmart] [--no-bestbuy] [--no-google]
                  [--cities CITY [CITY ...]] [--max-results N]
-                 [--export FILE] query [query ...]
+                 [--export FILE] [query ...]
 
 positional arguments:
   query                 Item to search for
 
 options:
+  --interactive         Launch interactive setup
   --source {amazon,bestbuy,craigslist,ebay,google,walmart} [{amazon,bestbuy,craigslist,ebay,google,walmart} ...]
                         Only search specific sources
   --no-ebay             Skip eBay

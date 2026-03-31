@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -99,10 +100,50 @@ _STOP_TOKENS = {
     "pack", "new", "used", "sale", "inch", "ft",
 }
 
+_INTENT_TERMS = {
+    "cable": {"cable", "cord", "wire"},
+    "adapter": {"adapter", "adaptor", "converter", "dongle"},
+    "display": {"display", "monitor", "screen"},
+    "dock": {"dock", "docking"},
+    "hub": {"hub"},
+    "charger": {"charger", "charging"},
+}
+
+_NOISE_CATEGORIES = {"display", "dock", "hub", "charger"}
+
 
 def _query_tokens(query: str) -> List[str]:
     tokens = re.findall(r"[a-z0-9]+", query.lower())
-    return [t for t in tokens if len(t) >= 2 and t not in _STOP_TOKENS]
+    return [t for t in tokens if (len(t) >= 2 or t.isdigit()) and t not in _STOP_TOKENS]
+
+
+def _intent_categories(text: str) -> set:
+    tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+    categories = set()
+    for category, words in _INTENT_TERMS.items():
+        if tokens & words:
+            categories.add(category)
+    return categories
+
+
+def _passes_intent_filters(title: str, query: str) -> bool:
+    query_categories = _intent_categories(query)
+    title_categories = _intent_categories(title)
+
+    if not query_categories:
+        return True
+
+    if "cable" in query_categories and "cable" not in title_categories:
+        return False
+
+    for category in _NOISE_CATEGORIES:
+        if category in title_categories and category not in query_categories:
+            return False
+
+    if "adapter" in title_categories and "adapter" not in query_categories and "cable" in query_categories:
+        return False
+
+    return True
 
 
 def _is_relevant_title(title: str, query: str) -> bool:
@@ -114,6 +155,9 @@ def _is_relevant_title(title: str, query: str) -> bool:
     query_l = query.lower().strip()
     if query_l and query_l in title_l:
         return True
+
+    if not _passes_intent_filters(title, query):
+        return False
 
     tokens = _query_tokens(query)
     if not tokens:
@@ -254,6 +298,64 @@ _SOURCE_LABELS = {
     "bestbuy": "Best Buy",
     "google": "Google Shopping",
 }
+
+
+def _parse_source_selection(value: str) -> List[str]:
+    raw = value.strip().lower()
+    if not raw or raw == "all":
+        return list(_SOURCE_LABELS.keys())
+
+    options = list(_SOURCE_LABELS.keys())
+    selected: List[str] = []
+    for part in re.split(r"[\s,]+", raw):
+        if not part:
+            continue
+        if part.isdigit():
+            idx = int(part) - 1
+            if 0 <= idx < len(options):
+                selected.append(options[idx])
+        elif part in _SOURCE_LABELS:
+            selected.append(part)
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(selected))
+
+
+def _interactive_setup(args: argparse.Namespace) -> Tuple[str, argparse.Namespace]:
+    console.print()
+    console.print(Panel("[bold cyan]Interactive DealFindr Setup[/bold cyan]", border_style="cyan"))
+
+    query = " ".join(args.query).strip() if args.query else ""
+    if not query:
+        query = Prompt.ask("What do you want to search for").strip()
+
+    console.print("[bold cyan]Available sources:[/bold cyan]")
+    for idx, (key, label) in enumerate(_SOURCE_LABELS.items(), 1):
+        console.print(f"  [dim]{idx}.[/dim] {label} [dim]({key})[/dim]")
+
+    source_answer = Prompt.ask(
+        "Choose sources by number or name, comma-separated",
+        default="all",
+    )
+    args.source = _parse_source_selection(source_answer)
+
+    if not args.source:
+        args.source = list(_SOURCE_LABELS.keys())
+
+    if "craigslist" in args.source and not args.cities:
+        city_answer = Prompt.ask(
+            "Craigslist cities (comma-separated)",
+            default="chicago",
+        )
+        args.cities = [part.strip().lower() for part in city_answer.split(",") if part.strip()]
+
+    max_results_answer = Prompt.ask("Max results per source", default=str(args.max_results))
+    try:
+        args.max_results = max(1, int(max_results_answer))
+    except ValueError:
+        args.max_results = 20
+
+    return query, args
 
 
 def search_craigslist(
@@ -803,26 +905,28 @@ def main() -> None:
         epilog="""
 examples:
   python dealfindr.py "apple thunderbolt 2 cable"
+  python dealfindr.py --interactive
   python dealfindr.py macbook pro --no-craigslist --max-results 10
-    python dealfindr.py "nintendo switch" --cities chicago
-    python dealfindr.py "apple thunderbolt 2 cable" --source amazon
-    python dealfindr.py "macbook pro" --source amazon ebay craigslist
+  python dealfindr.py "nintendo switch" --cities chicago
+  python dealfindr.py "apple thunderbolt 2 cable" --source amazon
+  python dealfindr.py "macbook pro" --source amazon ebay craigslist
   python dealfindr.py "iphone 15" --export results.csv
         """,
     )
-    parser.add_argument("query",           nargs="+", help="Item to search for")
+    parser.add_argument("query", nargs="*", help="Item to search for")
+    parser.add_argument("--interactive", action="store_true", help="Launch interactive setup")
     parser.add_argument(
         "--source",
         nargs="+",
         choices=sorted(_SOURCE_LABELS.keys()),
         help="Only search specific sources (choices: ebay craigslist amazon walmart bestbuy google)",
     )
-    parser.add_argument("--no-ebay",       action="store_true", help="Skip eBay")
-    parser.add_argument("--no-amazon",     action="store_true", help="Skip Amazon")
+    parser.add_argument("--no-ebay", action="store_true", help="Skip eBay")
+    parser.add_argument("--no-amazon", action="store_true", help="Skip Amazon")
     parser.add_argument("--no-craigslist", action="store_true", help="Skip Craigslist")
-    parser.add_argument("--no-walmart",    action="store_true", help="Skip Walmart")
-    parser.add_argument("--no-bestbuy",    action="store_true", help="Skip Best Buy")
-    parser.add_argument("--no-google",     action="store_true", help="Skip Google Shopping")
+    parser.add_argument("--no-walmart", action="store_true", help="Skip Walmart")
+    parser.add_argument("--no-bestbuy", action="store_true", help="Skip Best Buy")
+    parser.add_argument("--no-google", action="store_true", help="Skip Google Shopping")
     parser.add_argument(
         "--cities", nargs="+", metavar="CITY",
         help="Craigslist city slugs to search (default: chicago)",
@@ -837,7 +941,13 @@ examples:
     )
 
     args = parser.parse_args()
-    query = " ".join(args.query)
+    query = " ".join(args.query).strip()
+    if args.interactive or not query:
+        query, args = _interactive_setup(args)
+
+    if not query:
+        parser.error("Please provide a search query or run with --interactive.")
+
     scrapers = _build_scrapers(query, args)
 
     if not scrapers:
