@@ -14,7 +14,6 @@ import random
 import sys
 import csv
 import io
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -61,15 +60,24 @@ def _headers(referer: str = "") -> dict:
 _SESSION = requests.Session()
 
 
-def _get(url: str, timeout: int = 14, **kwargs) -> Optional[requests.Response]:
-    """GET with random UA and graceful failure."""
-    try:
-        headers = kwargs.pop("headers", _headers())
-        resp = _SESSION.get(url, headers=headers, timeout=timeout, **kwargs)
-        if resp.status_code == 200:
-            return resp
-    except Exception:
-        pass
+def _get(url: str, timeout: int = 14, retries: int = 2, **kwargs) -> Optional[requests.Response]:
+    """GET with random UA, short retry loop, and graceful failure."""
+    headers = kwargs.pop("headers", None)
+    # Use separate connect/read timeouts to avoid long hangs on blocked hosts.
+    req_timeout = kwargs.pop("timeout", (6, timeout))
+
+    for _ in range(max(1, retries + 1)):
+        try:
+            resp = _SESSION.get(
+                url,
+                headers=headers or _headers(),
+                timeout=req_timeout,
+                **kwargs,
+            )
+            if resp.status_code == 200:
+                return resp
+        except Exception:
+            time.sleep(0.2)
     return None
 
 
@@ -84,6 +92,42 @@ def _parse_price(text: str) -> Optional[float]:
         except ValueError:
             pass
     return None
+
+
+_STOP_TOKENS = {
+    "a", "an", "the", "for", "with", "to", "from", "and", "or", "on", "in", "of",
+    "pack", "new", "used", "sale", "inch", "ft",
+}
+
+
+def _query_tokens(query: str) -> List[str]:
+    tokens = re.findall(r"[a-z0-9]+", query.lower())
+    return [t for t in tokens if len(t) >= 2 and t not in _STOP_TOKENS]
+
+
+def _is_relevant_title(title: str, query: str) -> bool:
+    """Basic relevance gate to filter obvious mismatches from broad site search pages."""
+    if not title:
+        return False
+
+    title_l = title.lower()
+    query_l = query.lower().strip()
+    if query_l and query_l in title_l:
+        return True
+
+    tokens = _query_tokens(query)
+    if not tokens:
+        return True
+
+    hits = sum(1 for t in tokens if t in title_l)
+    if len(tokens) <= 2:
+        needed = 1
+    elif len(tokens) <= 4:
+        needed = 2
+    else:
+        needed = 3
+
+    return hits >= needed
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -122,21 +166,34 @@ def search_ebay(query: str, max_results: int = 20) -> List[Deal]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    for item in soup.select(".s-item"):
+    # eBay now renders result rows as card elements under li[data-view].
+    card_items = soup.select("li[data-view]") or soup.select(".s-item")
+
+    for item in card_items:
         if len(deals) >= max_results:
             break
         try:
-            title_el = item.select_one(".s-item__title")
-            price_el  = item.select_one(".s-item__price")
-            link_el   = item.select_one("a.s-item__link")
-            ship_el   = item.select_one(".s-item__shipping, .s-item__freeXDays")
-            cond_el   = item.select_one(".SECONDARY_INFO")
+            title_el = item.select_one(
+                ".s-card__title, .su-styled-text.primary.default, .s-item__title"
+            )
+            price_el = item.select_one(
+                ".s-card__price, .su-styled-text.s-card__price, .s-item__price"
+            )
+            link_el = item.select_one("a.s-card__link[href], a.s-item__link[href]")
+            ship_el = item.select_one(
+                ".su-styled-text.secondary.large, .s-item__shipping, .s-item__freeXDays"
+            )
+            cond_el = item.select_one(
+                ".su-styled-text.secondary.default, .SECONDARY_INFO"
+            )
 
             if not (title_el and price_el and link_el):
                 continue
 
             title = title_el.get_text(strip=True)
             if title in ("Shop on eBay", ""):
+                continue
+            if not _is_relevant_title(title, query):
                 continue
 
             # Price ranges → take lower bound
@@ -150,6 +207,8 @@ def search_ebay(query: str, max_results: int = 20) -> List[Deal]:
 
             # Strip eBay tracking from URL
             link = link_el.get("href", "")
+            if link.startswith("//"):
+                link = f"https:{link}"
             link = re.sub(r"[?&](?:hash|_trkparms|_trksid)[^&]*", "", link).rstrip("?&")
 
             shipping: Optional[float] = None
@@ -193,7 +252,7 @@ def search_craigslist(
     cities: Optional[List[str]] = None,
     max_results: int = 20,
 ) -> List[Deal]:
-    """Craigslist for-sale search via public RSS feeds."""
+    """Craigslist for-sale search via HTML + JSON-LD listing data."""
     cities = cities or _CL_CITIES
     deals: List[Deal] = []
 
@@ -203,26 +262,73 @@ def search_craigslist(
         try:
             url = (
                 f"https://{city}.craigslist.org/search/sss"
-                f"?query={quote_plus(query)}&sort=date&format=rss"
+                f"?query={quote_plus(query)}&sort=date"
             )
             resp = _get(url, timeout=10)
             if not resp:
                 continue
 
-            root = ET.fromstring(resp.content)
-            for item in root.findall(".//item")[:8]:
-                try:
-                    title = (item.findtext("title") or "").strip()
-                    link  = (item.findtext("link")  or "").strip()
-                    desc  = item.findtext("description") or ""
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-                    # Price must appear somewhere
-                    pm = re.search(r"\$\s*([\d,]+(?:\.\d{2})?)", title + " " + desc)
-                    if not pm:
+            # Primary source: JSON-LD block with structured search results.
+            ld_script = soup.find("script", id="ld_searchpage_results")
+            if not ld_script or not ld_script.string:
+                continue
+
+            data = json.loads(ld_script.string)
+            items = data.get("itemListElement", [])
+
+            # Build a searchable list of visible listing links with their displayed titles.
+            listing_nodes = soup.select("li.cl-static-search-result a[href*='/d/']")
+            listing_candidates = []
+            for node in listing_nodes:
+                href = node.get("href", "")
+                shown_title = ""
+                title_div = node.select_one(".title")
+                if title_div:
+                    shown_title = title_div.get_text(" ", strip=True)
+                if not shown_title:
+                    shown_title = node.get_text(" ", strip=True)
+                if href and shown_title:
+                    listing_candidates.append((shown_title, href))
+
+            used_links: set = set()
+            for item in items[:10]:
+                try:
+                    product = item.get("item") or {}
+                    title = str(product.get("name") or "").strip()
+                    if not title:
+                        continue
+                    if not _is_relevant_title(title, query):
                         continue
 
-                    price = _parse_price(pm.group())
+                    offers = product.get("offers") or {}
+                    price = _parse_price(str(offers.get("price") or ""))
                     if not price or price <= 0:
+                        continue
+
+                    link = ""
+
+                    # Match listing by title-token overlap (more robust than positional index).
+                    title_tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
+                    best_score = 0
+                    best_link = ""
+                    for shown_title, href in listing_candidates:
+                        if href in used_links:
+                            continue
+                        shown_tokens = set(re.findall(r"[a-z0-9]+", shown_title.lower()))
+                        if not shown_tokens:
+                            continue
+                        overlap = len(title_tokens & shown_tokens)
+                        if overlap > best_score:
+                            best_score = overlap
+                            best_link = href
+
+                    if best_score >= 2:
+                        link = best_link
+                        used_links.add(best_link)
+
+                    if not link:
                         continue
 
                     deals.append(
@@ -232,7 +338,7 @@ def search_craigslist(
                 except Exception:
                     continue
 
-            time.sleep(0.25)
+            time.sleep(0.2)
         except Exception:
             continue
 
@@ -270,6 +376,8 @@ def search_amazon(query: str, max_results: int = 20) -> List[Deal]:
                 continue
 
             title = title_el.get_text(strip=True)
+            if not _is_relevant_title(title, query):
+                continue
             price_str = whole.get_text(strip=True).replace(",", "")
             if frac:
                 price_str += "." + frac.get_text(strip=True)
@@ -357,6 +465,8 @@ def search_walmart(query: str, max_results: int = 20) -> List[Deal]:
             title = str(item.get("name") or item.get("title") or "").strip()
             if not title or title in seen:
                 continue
+            if not _is_relevant_title(title, query):
+                continue
             seen.add(title)
 
             # Price extraction — try common keys
@@ -431,6 +541,8 @@ def search_bestbuy(query: str, max_results: int = 20) -> List[Deal]:
                 continue
 
             title = title_el.get_text(strip=True)
+            if not _is_relevant_title(title, query):
+                continue
             price = _parse_price(price_el.get_text(strip=True))
             if not price or price <= 0:
                 continue
@@ -494,6 +606,8 @@ def search_google_shopping(query: str, max_results: int = 20) -> List[Deal]:
                 continue
 
             title = title_el.get_text(strip=True)
+            if not _is_relevant_title(title, query):
+                continue
             price = _parse_price(price_el.get_text(strip=True))
             if not price or price <= 0:
                 continue
