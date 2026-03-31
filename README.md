@@ -25,7 +25,7 @@
 DealFindr is a **local, no-API-key price comparison tool** that simultaneously searches six major shopping platforms and returns results sorted cheapest to most expensive — right in your terminal.
 
 ```
-$ python dealfindr.py "apple thunderbolt 2 cable"
+$ python3 dealfindr.py "apple thunderbolt 2 cable"
 ```
 
 ```
@@ -90,7 +90,19 @@ source .venv/bin/activate
 
 ### 3. Install dependencies
 
+**Linux (Debian / Ubuntu)** — install `pip` first if needed:
 ```bash
+sudo apt install python3-pip
+python3 -m pip install -r requirements.txt
+```
+
+**macOS:**
+```bash
+pip3 install -r requirements.txt
+```
+
+**Windows:**
+```powershell
 pip install -r requirements.txt
 ```
 
@@ -103,37 +115,39 @@ pip install -r requirements.txt
 ### Basic search
 
 ```bash
-python dealfindr.py "apple thunderbolt 2 cable"
+python3 dealfindr.py "apple thunderbolt 2 cable"
 ```
+
+> On Windows use `python` instead of `python3`.
 
 ### Multi-word queries (no quotes needed)
 
 ```bash
-python dealfindr.py macbook pro m3
+python3 dealfindr.py macbook pro m3
 ```
 
 ### Skip specific sources
 
 ```bash
-python dealfindr.py "ps5 controller" --no-craigslist --no-google
+python3 dealfindr.py "ps5 controller" --no-craigslist --no-google
 ```
 
 ### Search specific Craigslist cities
 
 ```bash
-python dealfindr.py "vintage guitar" --cities losangeles sfbay newyork chicago seattle
+python3 dealfindr.py "vintage guitar" --cities losangeles sfbay newyork chicago seattle
 ```
 
 ### Limit results per source
 
 ```bash
-python dealfindr.py "airpods" --max-results 5
+python3 dealfindr.py "airpods" --max-results 5
 ```
 
 ### Export to CSV
 
 ```bash
-python dealfindr.py "iphone 15 pro" --export results.csv
+python3 dealfindr.py "iphone 15 pro" --export results.csv
 ```
 
 ### All options
