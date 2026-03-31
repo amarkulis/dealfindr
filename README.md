@@ -132,10 +132,20 @@ python3 dealfindr.py macbook pro m3
 python3 dealfindr.py "ps5 controller" --no-craigslist --no-google
 ```
 
-### Search specific Craigslist cities
+### Search one source only
 
 ```bash
-python3 dealfindr.py "vintage guitar" --cities losangeles sfbay newyork chicago seattle
+python3 dealfindr.py "apple thunderbolt 2 cable" --source amazon
+python3 dealfindr.py "macbook pro" --source amazon ebay craigslist
+```
+
+### Search specific Craigslist cities
+
+Craigslist defaults to `chicago` if you do not pass `--cities`.
+
+```bash
+python3 dealfindr.py "vintage guitar" --cities chicago
+python3 dealfindr.py "vintage guitar" --cities chicago milwaukee madison
 ```
 
 ### Limit results per source
@@ -153,7 +163,8 @@ python3 dealfindr.py "iphone 15 pro" --export results.csv
 ### All options
 
 ```
-usage: dealfindr [-h] [--no-ebay] [--no-amazon] [--no-craigslist]
+usage: dealfindr [-h] [--source {amazon,bestbuy,craigslist,ebay,google,walmart} [{amazon,bestbuy,craigslist,ebay,google,walmart} ...]]
+                 [--no-ebay] [--no-amazon] [--no-craigslist]
                  [--no-walmart] [--no-bestbuy] [--no-google]
                  [--cities CITY [CITY ...]] [--max-results N]
                  [--export FILE] query [query ...]
@@ -162,6 +173,8 @@ positional arguments:
   query                 Item to search for
 
 options:
+  --source {amazon,bestbuy,craigslist,ebay,google,walmart} [{amazon,bestbuy,craigslist,ebay,google,walmart} ...]
+                        Only search specific sources
   --no-ebay             Skip eBay
   --no-amazon           Skip Amazon
   --no-craigslist       Skip Craigslist
@@ -169,7 +182,7 @@ options:
   --no-bestbuy          Skip Best Buy
   --no-google           Skip Google Shopping
   --cities CITY [CITY ...]
-                        Craigslist city slugs (e.g. losangeles sfbay newyork)
+                        Craigslist city slugs (default: chicago)
   --max-results N       Max results per source (default: 20)
   --export FILE         Export results to a CSV file
 ```

@@ -246,6 +246,15 @@ _CL_CITIES = [
     "boston",     "dallas", "phoenix","houston",
 ]
 
+_SOURCE_LABELS = {
+    "ebay": "eBay",
+    "craigslist": "Craigslist",
+    "amazon": "Amazon",
+    "walmart": "Walmart",
+    "bestbuy": "Best Buy",
+    "google": "Google Shopping",
+}
+
 
 def search_craigslist(
     query: str,
@@ -357,8 +366,9 @@ def search_amazon(query: str, max_results: int = 20) -> List[Deal]:
     if not resp:
         return deals
 
-    # Detect robot/captcha page
-    if "robot" in resp.text.lower() or "captcha" in resp.text.lower():
+    # Detect explicit bot-check pages while avoiding false positives in normal search HTML.
+    lower_text = resp.text.lower()
+    if "captcha" in lower_text or "enter the characters you see below" in lower_text:
         return deals
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -367,12 +377,12 @@ def search_amazon(query: str, max_results: int = 20) -> List[Deal]:
         if len(deals) >= max_results:
             break
         try:
-            title_el  = result.select_one("h2 .a-text-normal, h2 a span")
-            link_el   = result.select_one("h2 a")
+            title_el  = result.select_one("h2 span, h2 .a-text-normal")
+            link_el   = result.select_one("a.a-link-normal.s-no-outline, h2 a")
             whole     = result.select_one(".a-price-whole")
             frac      = result.select_one(".a-price-fraction")
 
-            if not (title_el and whole):
+            if not (title_el and whole and link_el):
                 continue
 
             title = title_el.get_text(strip=True)
@@ -766,19 +776,20 @@ def _build_scrapers(
 ) -> List[Tuple[str, Callable]]:
     scrapers: List[Tuple[str, Callable]] = []
     m = args.max_results
-    c = args.cities or None
+    c = args.cities or ["chicago"]
+    selected = set(args.source or _SOURCE_LABELS.keys())
 
-    if not args.no_ebay:
+    if "ebay" in selected and not args.no_ebay:
         scrapers.append(("eBay",            lambda q=query, n=m: search_ebay(q, n)))
-    if not args.no_craigslist:
+    if "craigslist" in selected and not args.no_craigslist:
         scrapers.append(("Craigslist",      lambda q=query, cities=c, n=m: search_craigslist(q, cities, n)))
-    if not args.no_amazon:
+    if "amazon" in selected and not args.no_amazon:
         scrapers.append(("Amazon",          lambda q=query, n=m: search_amazon(q, n)))
-    if not args.no_walmart:
+    if "walmart" in selected and not args.no_walmart:
         scrapers.append(("Walmart",         lambda q=query, n=m: search_walmart(q, n)))
-    if not args.no_bestbuy:
+    if "bestbuy" in selected and not args.no_bestbuy:
         scrapers.append(("Best Buy",        lambda q=query, n=m: search_bestbuy(q, n)))
-    if not args.no_google:
+    if "google" in selected and not args.no_google:
         scrapers.append(("Google Shopping", lambda q=query, n=m: search_google_shopping(q, n)))
 
     return scrapers
@@ -793,11 +804,19 @@ def main() -> None:
 examples:
   python dealfindr.py "apple thunderbolt 2 cable"
   python dealfindr.py macbook pro --no-craigslist --max-results 10
-  python dealfindr.py "nintendo switch" --cities losangeles sfbay chicago
+    python dealfindr.py "nintendo switch" --cities chicago
+    python dealfindr.py "apple thunderbolt 2 cable" --source amazon
+    python dealfindr.py "macbook pro" --source amazon ebay craigslist
   python dealfindr.py "iphone 15" --export results.csv
         """,
     )
     parser.add_argument("query",           nargs="+", help="Item to search for")
+    parser.add_argument(
+        "--source",
+        nargs="+",
+        choices=sorted(_SOURCE_LABELS.keys()),
+        help="Only search specific sources (choices: ebay craigslist amazon walmart bestbuy google)",
+    )
     parser.add_argument("--no-ebay",       action="store_true", help="Skip eBay")
     parser.add_argument("--no-amazon",     action="store_true", help="Skip Amazon")
     parser.add_argument("--no-craigslist", action="store_true", help="Skip Craigslist")
@@ -806,7 +825,7 @@ examples:
     parser.add_argument("--no-google",     action="store_true", help="Skip Google Shopping")
     parser.add_argument(
         "--cities", nargs="+", metavar="CITY",
-        help="Craigslist city slugs to search (e.g. losangeles sfbay newyork)",
+        help="Craigslist city slugs to search (default: chicago)",
     )
     parser.add_argument(
         "--max-results", type=int, default=20, metavar="N",
@@ -819,19 +838,23 @@ examples:
 
     args = parser.parse_args()
     query = " ".join(args.query)
+    scrapers = _build_scrapers(query, args)
+
+    if not scrapers:
+        parser.error("No sources selected. Remove --no-* flags or use --source with at least one source.")
+
+    active_sources = " · ".join(name for name, _ in scrapers)
 
     console.print()
     console.print(
         Panel(
             f"[bold cyan]DealFindr[/bold cyan]  [dim]|[/dim]  "
             f"Searching for [bold yellow]{query}[/bold yellow]\n"
-            "[dim]Scraping eBay · Craigslist · Amazon · Walmart · Best Buy · Google Shopping[/dim]",
+            f"[dim]Scraping {active_sources}[/dim]",
             border_style="cyan",
         )
     )
     console.print()
-
-    scrapers = _build_scrapers(query, args)
     all_deals: List[Deal] = []
 
     with Progress(
