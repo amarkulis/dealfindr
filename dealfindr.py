@@ -237,6 +237,8 @@ def search_ebay(query: str, max_results: int = 20) -> List[Deal]:
             title = title_el.get_text(strip=True)
             if title in ("Shop on eBay", ""):
                 continue
+            title = re.sub(r"\s*Opens in a new window or tab\s*", "", title, flags=re.IGNORECASE).strip()
+            title = re.sub(r"\s+", " ", title)
             if not _is_relevant_title(title, query):
                 continue
 
@@ -253,7 +255,11 @@ def search_ebay(query: str, max_results: int = 20) -> List[Deal]:
             link = link_el.get("href", "")
             if link.startswith("//"):
                 link = f"https:{link}"
-            link = re.sub(r"[?&](?:hash|_trkparms|_trksid)[^&]*", "", link).rstrip("?&")
+            m = re.search(r"https?://(?:www\.)?ebay\.com/itm/(\d+)", link)
+            if m:
+                link = f"https://www.ebay.com/itm/{m.group(1)}"
+            else:
+                link = link.split("?")[0].rstrip("/")
 
             shipping: Optional[float] = None
             if ship_el:
