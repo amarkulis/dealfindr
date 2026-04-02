@@ -7,13 +7,15 @@ locally without any API keys. Results are sorted cheapest → most expensive.
 """
 
 import argparse
-import json
-import re
-import time
-import random
-import sys
 import csv
 import io
+import json
+import logging
+import random
+import re
+import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -29,6 +31,9 @@ from rich.table import Table
 from rich.text import Text
 
 console = Console()
+log = logging.getLogger("dealfindr")
+
+__version__ = "1.0.0"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP helpers
@@ -58,7 +63,14 @@ def _headers(referer: str = "") -> dict:
     return h
 
 
-_SESSION = requests.Session()
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """Return a per-thread requests.Session for thread-safe HTTP."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
 
 
 def _get(url: str, timeout: int = 14, retries: int = 2, **kwargs) -> Optional[requests.Response]:
@@ -67,9 +79,9 @@ def _get(url: str, timeout: int = 14, retries: int = 2, **kwargs) -> Optional[re
     # Use separate connect/read timeouts to avoid long hangs on blocked hosts.
     req_timeout = kwargs.pop("timeout", (6, timeout))
 
-    for _ in range(max(1, retries + 1)):
+    for attempt in range(max(1, retries + 1)):
         try:
-            resp = _SESSION.get(
+            resp = _get_session().get(
                 url,
                 headers=headers or _headers(),
                 timeout=req_timeout,
@@ -77,8 +89,11 @@ def _get(url: str, timeout: int = 14, retries: int = 2, **kwargs) -> Optional[re
             )
             if resp.status_code == 200:
                 return resp
-        except Exception:
+            log.debug("GET %s returned status %d", url, resp.status_code)
+        except Exception as exc:
+            log.debug("GET %s attempt %d failed: %s", url, attempt + 1, exc)
             time.sleep(0.2)
+    log.debug("GET %s gave up after %d attempts", url, retries + 1)
     return None
 
 
@@ -875,6 +890,32 @@ def export_csv(deals: List[Deal], query: str) -> str:
     return buf.getvalue()
 
 
+def export_json(deals: List[Deal], query: str) -> str:
+    """Return JSON string of results sorted cheapest → most expensive."""
+    unique = _dedupe_and_sort(deals)
+    return json.dumps(
+        {
+            "query": query,
+            "count": len(unique),
+            "deals": [
+                {
+                    "rank": i,
+                    "title": d.title,
+                    "price": d.price,
+                    "shipping": d.shipping,
+                    "total_price": d.total_price,
+                    "source": d.source,
+                    "condition": d.condition,
+                    "url": d.url,
+                    "location": d.location,
+                }
+                for i, d in enumerate(unique, 1)
+            ],
+        },
+        indent=2,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -945,8 +986,39 @@ examples:
         "--export", metavar="FILE",
         help="Export results to a CSV file",
     )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Output results as JSON instead of the Rich table",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Verbose logging output",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Debug-level logging (very detailed)",
+    )
+    parser.add_argument(
+        "--version", action="version",
+        version=f"%(prog)s {__version__}",
+    )
 
     args = parser.parse_args()
+
+    # Configure logging based on verbosity flags.
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(levelname)s %(name)s: %(message)s",
+        )
+    elif args.verbose:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s: %(message)s",
+        )
+    else:
+        logging.basicConfig(level=logging.WARNING)
+
     query = " ".join(args.query).strip()
     if args.interactive or not query:
         query, args = _interactive_setup(args)
@@ -998,13 +1070,17 @@ examples:
                             f"[dim]({len(results)} result{'s' if len(results) != 1 else ''})[/dim]"
                         ),
                     )
-                except Exception:
+                except Exception as exc:
+                    log.warning("Scraper %s failed: %s", name, exc)
                     progress.update(
                         task_map[name],
                         description=f"  [red]✗[/red] {name} [dim](failed)[/dim]",
                     )
 
-    display_results(all_deals, query)
+    if args.json:
+        print(export_json(all_deals, query))
+    else:
+        display_results(all_deals, query)
 
     if args.export:
         csv_data = export_csv(all_deals, query)
