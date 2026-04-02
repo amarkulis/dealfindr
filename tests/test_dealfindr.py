@@ -117,6 +117,48 @@ class TestRelevance:
         )
 
 
+class TestModifierTokens:
+    def test_standalone_number_is_core(self):
+        # "15" in "iphone 15" is a model number, not a modifier
+        assert not dealfindr._is_modifier_token("15")
+
+    def test_qty_unit_is_modifier(self):
+        assert dealfindr._is_modifier_token("2lb")
+        assert dealfindr._is_modifier_token("24oz")
+        assert dealfindr._is_modifier_token("16gb")
+
+    def test_unit_word_is_modifier(self):
+        assert dealfindr._is_modifier_token("lb")
+        assert dealfindr._is_modifier_token("oz")
+
+    def test_product_word_is_not_modifier(self):
+        assert not dealfindr._is_modifier_token("iphone")
+        assert not dealfindr._is_modifier_token("pistachios")
+
+    def test_iphone_15_rejects_iphone_14(self):
+        # "15" is core, so "iphone 14" must NOT match "iphone 15"
+        assert not dealfindr._is_relevant_title(
+            "Apple iPhone 14 Pro Max 256GB", "iphone 15"
+        )
+
+    def test_iphone_15_accepts_iphone_15(self):
+        assert dealfindr._is_relevant_title(
+            "Apple iPhone 15 Pro 128GB Unlocked", "iphone 15"
+        )
+
+    def test_ps5_rejects_ps4(self):
+        assert not dealfindr._is_relevant_title(
+            "Sony PS4 DualShock Controller", "ps5 controller"
+        )
+
+    def test_2lb_pistachios_allows_different_weight(self):
+        # "2lb" is a modifier, so a 1lb bag of the right product should pass
+        assert dealfindr._is_relevant_title(
+            "Wonderful Pistachios Shelled 1lb Bag",
+            "2lb shelled pistachios",
+        )
+
+
 class TestFuzzyMatching:
     def test_typo_pistachio(self):
         # "pistashios" (typo) should fuzzy-match "pistachios"

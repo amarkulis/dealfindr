@@ -162,6 +162,32 @@ def _passes_intent_filters(title: str, query: str) -> bool:
     return True
 
 
+_UNIT_WORDS = {
+    "lb", "lbs", "pound", "pounds", "oz", "ounce", "ounces",
+    "kg", "gram", "grams", "ct", "count", "pk", "mm", "cm",
+    "qt", "gal", "gallon", "ml", "liter",
+}
+
+# Regex for a number glued to a unit suffix — e.g. "2lb", "24oz", "0.5m", "16gb".
+# These are quantity/size modifiers, NOT model numbers.
+_QTY_UNIT_RE = re.compile(
+    r"^\d+(?:\.\d+)?"               # leading digits (possibly decimal)
+    r"(?:lb|lbs|oz|kg|g|mm|cm|m|ct|pk|pt|qt|gal|ml|gb|tb|ft|in)$",
+    re.IGNORECASE,
+)
+
+
+def _is_modifier_token(token: str) -> bool:
+    """True if *token* is a quantity+unit like '2lb' or '24oz'.
+
+    Standalone numbers ('15', '2', '3') are treated as **core** tokens because
+    they are usually model/version numbers (iPhone 15, Thunderbolt 2, PS5).
+    """
+    if _QTY_UNIT_RE.match(token):
+        return True                        # "2lb", "24oz", "16gb"
+    return token in _UNIT_WORDS
+
+
 def _fuzzy_token_in_title(token: str, title_words: List[str]) -> bool:
     """Check if *token* fuzzy-matches any word in the title (handles typos)."""
     if len(token) < 4:
@@ -174,10 +200,21 @@ def _fuzzy_token_in_title(token: str, title_words: List[str]) -> bool:
     return False
 
 
+def _token_hits_title(token: str, title_l: str, title_words: List[str]) -> bool:
+    """Check whether *token* appears in *title_l* (exact substring or fuzzy)."""
+    if token in title_l:
+        return True
+    return _fuzzy_token_in_title(token, title_words)
+
+
 def _is_relevant_title(title: str, query: str) -> bool:
-    """Relevance gate — filters obvious mismatches.  Uses fuzzy matching
-    so that minor typos in the query don't kill valid results while still
-    requiring that the core product name appears somewhere in the title."""
+    """Relevance gate — filters obvious mismatches.
+
+    Tokens are classified as **core** (product descriptors like 'shelled',
+    'pistachios') or **modifier** (quantities/units like '2lb').  All core
+    tokens must match (with fuzzy typo tolerance).  Modifier tokens are
+    optional — they improve ranking but don't disqualify a result.
+    """
     if not title:
         return False
 
@@ -196,22 +233,24 @@ def _is_relevant_title(title: str, query: str) -> bool:
     if not tokens:
         return True
 
+    core   = [t for t in tokens if not _is_modifier_token(t)]
+    modifiers = [t for t in tokens if _is_modifier_token(t)]
     title_words = re.findall(r"[a-z0-9]+", title_l)
-    hits = 0
-    for t in tokens:
-        if t in title_l:
-            hits += 1
-        elif _fuzzy_token_in_title(t, title_words):
-            hits += 1
 
-    # Require a high proportion of tokens to match.  Short queries (the
-    # common case) must match every token.  Longer queries get one miss.
-    if len(tokens) <= 3:
-        needed = len(tokens)
-    else:
-        needed = len(tokens) - 1
+    # All core tokens must match (product name / key descriptors).
+    core_hits = sum(1 for t in core if _token_hits_title(t, title_l, title_words))
+    if core:
+        # For 1-3 core tokens require all.  For 4+ allow one miss.
+        needed = len(core) if len(core) <= 3 else len(core) - 1
+        if core_hits < needed:
+            return False
 
-    return hits >= needed
+    # If there are ONLY modifiers and no core tokens, require at least one.
+    if not core:
+        mod_hits = sum(1 for t in modifiers if _token_hits_title(t, title_l, title_words))
+        return mod_hits >= 1
+
+    return True
 
 
 # Pairs where the query term and the title term are contradictory.
