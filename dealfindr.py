@@ -189,6 +189,9 @@ def _is_relevant_title(title: str, query: str) -> bool:
     if not _passes_intent_filters(title, query):
         return False
 
+    if _has_contradiction(title, query):
+        return False
+
     tokens = _query_tokens(query)
     if not tokens:
         return True
@@ -209,6 +212,40 @@ def _is_relevant_title(title: str, query: str) -> bool:
         needed = len(tokens) - 1
 
     return hits >= needed
+
+
+# Pairs where the query term and the title term are contradictory.
+# Each tuple is (query_pattern, title_pattern) — if the query matches the
+# first regex and the title matches the second, the result is rejected.
+_CONTRADICTIONS = [
+    # "shelled" (without "in-shell") vs "in-shell" / "in shell" / "inshell"
+    (r"\bshelled\b(?!.*\bin[- ]?shell)", r"\bin[- ]?shell"),
+    # "in-shell" vs bare "shelled" (without "in-shell")
+    (r"\bin[- ]?shell\b", r"(?<!\bin)\bshelled\b"),
+    # "unsalted" vs "salted" (without "unsalted")
+    (r"\bunsalted\b", r"(?<!un)\bsalted\b(?!.*\bunsalted\b)"),
+    # "salted" (without "unsalted") vs "unsalted"
+    (r"(?<!un)\bsalted\b(?!.*\bunsalted\b)", r"\bunsalted\b"),
+    # "raw" vs "roasted"
+    (r"\braw\b", r"\broasted\b"),
+    (r"\broasted\b", r"\braw\b"),
+    # "wireless" vs "wired"
+    (r"\bwireless\b", r"(?<!wire)\bwired\b"),
+    (r"(?<!wire)\bwired\b", r"\bwireless\b"),
+    # "new" vs "refurbished"/"renewed"
+    (r"\bnew\b", r"\b(?:refurbished|renewed)\b"),
+    (r"\b(?:refurbished|renewed)\b", r"\bnew\b"),
+]
+
+
+def _has_contradiction(title: str, query: str) -> bool:
+    """Return True if the title contradicts a specific term in the query."""
+    q = query.lower()
+    t = title.lower()
+    for q_pat, t_pat in _CONTRADICTIONS:
+        if re.search(q_pat, q) and re.search(t_pat, t):
+            return True
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────

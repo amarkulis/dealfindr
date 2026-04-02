@@ -140,6 +140,46 @@ class TestFuzzyMatching:
         )
 
 
+class TestContradictions:
+    def test_shelled_rejects_in_shell(self):
+        assert not dealfindr._is_relevant_title(
+            "Roasted In-Shell Pistachios USDA Food 2LB",
+            "2lb shelled pistachios",
+        )
+
+    def test_shelled_accepts_shelled(self):
+        assert dealfindr._is_relevant_title(
+            "Wonderful Pistachios Shelled 2lb Bag",
+            "2lb shelled pistachios",
+        )
+
+    def test_in_shell_rejects_shelled(self):
+        assert not dealfindr._is_relevant_title(
+            "Pistachios Shelled Raw Unsalted 2Lbs",
+            "2lb in-shell pistachios",
+        )
+
+    def test_unsalted_rejects_salted(self):
+        assert dealfindr._has_contradiction(
+            "Sea Salted Pistachios 2lb", "unsalted pistachios"
+        )
+
+    def test_salted_rejects_unsalted(self):
+        assert dealfindr._has_contradiction(
+            "Unsalted Raw Pistachios", "salted pistachios"
+        )
+
+    def test_raw_rejects_roasted(self):
+        assert dealfindr._has_contradiction(
+            "Roasted Salted Pistachios", "raw pistachios"
+        )
+
+    def test_no_contradiction_when_matching(self):
+        assert not dealfindr._has_contradiction(
+            "Shelled Pistachios 2lb", "2lb shelled pistachios"
+        )
+
+
 class TestIntentFilters:
     def test_cable_query_rejects_display(self):
         assert not dealfindr._passes_intent_filters(
