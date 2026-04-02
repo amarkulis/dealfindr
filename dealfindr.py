@@ -10,6 +10,7 @@ import argparse
 import csv
 import io
 import json
+from difflib import SequenceMatcher
 import logging
 import random
 import re
@@ -161,8 +162,22 @@ def _passes_intent_filters(title: str, query: str) -> bool:
     return True
 
 
+def _fuzzy_token_in_title(token: str, title_words: List[str]) -> bool:
+    """Check if *token* fuzzy-matches any word in the title (handles typos)."""
+    if len(token) < 4:
+        return False
+    for word in title_words:
+        if len(word) < 3:
+            continue
+        if SequenceMatcher(None, token, word).ratio() >= 0.75:
+            return True
+    return False
+
+
 def _is_relevant_title(title: str, query: str) -> bool:
-    """Basic relevance gate to filter obvious mismatches from broad site search pages."""
+    """Relevance gate — filters obvious mismatches.  Uses fuzzy matching
+    so that minor typos in the query don't kill valid results while still
+    requiring that the core product name appears somewhere in the title."""
     if not title:
         return False
 
@@ -178,13 +193,20 @@ def _is_relevant_title(title: str, query: str) -> bool:
     if not tokens:
         return True
 
-    hits = sum(1 for t in tokens if t in title_l)
-    if len(tokens) <= 2:
-        needed = 1
-    elif len(tokens) <= 4:
-        needed = 2
+    title_words = re.findall(r"[a-z0-9]+", title_l)
+    hits = 0
+    for t in tokens:
+        if t in title_l:
+            hits += 1
+        elif _fuzzy_token_in_title(t, title_words):
+            hits += 1
+
+    # Require a high proportion of tokens to match.  Short queries (the
+    # common case) must match every token.  Longer queries get one miss.
+    if len(tokens) <= 3:
+        needed = len(tokens)
     else:
-        needed = 3
+        needed = len(tokens) - 1
 
     return hits >= needed
 

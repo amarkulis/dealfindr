@@ -88,14 +88,56 @@ class TestRelevance:
             "Samsung Galaxy Phone Case", "apple thunderbolt cable"
         )
 
-    def test_partial_token_overlap(self):
-        # "apple" and "cable" hit → 2 of 3 meaningful tokens → passes (need 2)
-        assert dealfindr._is_relevant_title(
+    def test_partial_token_overlap_rejected_when_strict(self):
+        # 3 tokens: "apple", "thunderbolt", "cable" → needs all 3
+        # Title has "apple" + "cable" but NOT "thunderbolt" → rejected
+        assert not dealfindr._is_relevant_title(
             "Apple USB-C to Lightning Cable 1m", "apple thunderbolt cable"
+        )
+
+    def test_all_tokens_match(self):
+        assert dealfindr._is_relevant_title(
+            "Apple Thunderbolt 3 Cable USB-C", "apple thunderbolt cable"
         )
 
     def test_single_token_query(self):
         assert dealfindr._is_relevant_title("AirPods Pro 2nd Gen", "airpods")
+
+    def test_walnuts_rejected_for_pistachio_query(self):
+        # The bug: "2lb" + "shelled" matched but product name didn't
+        assert not dealfindr._is_relevant_title(
+            "Sincerely Nuts Raw Shelled Walnuts (2lb bag)",
+            "2lb shelled pistachios",
+        )
+
+    def test_four_token_allows_one_miss(self):
+        # 4 tokens → needs 3
+        assert dealfindr._is_relevant_title(
+            "Apple Thunderbolt Cable 2m", "apple thunderbolt 2 cable"
+        )
+
+
+class TestFuzzyMatching:
+    def test_typo_pistachio(self):
+        # "pistashios" (typo) should fuzzy-match "pistachios"
+        assert dealfindr._is_relevant_title(
+            "Wonderful Pistachios Shelled 2lb Bag",
+            "2lb shelled pistashios",
+        )
+
+    def test_typo_does_not_match_unrelated(self):
+        assert not dealfindr._fuzzy_token_in_title(
+            "pistashios", ["walnuts", "shelled", "raw"]
+        )
+
+    def test_short_tokens_skip_fuzzy(self):
+        # Tokens < 4 chars should not attempt fuzzy matching
+        assert not dealfindr._fuzzy_token_in_title("2lb", ["2lbs", "bag"])
+
+    def test_close_match_passes(self):
+        assert dealfindr._fuzzy_token_in_title(
+            "thunderblt", ["thunderbolt", "cable"]
+        )
 
 
 class TestIntentFilters:
