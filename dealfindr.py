@@ -2,15 +2,16 @@
 """
 DealFindr — Find the best prices across multiple shopping platforms.
 
-Searches eBay, Craigslist, Amazon, Walmart, Best Buy, and Google Shopping
-locally without any API keys. Results are sorted cheapest → most expensive.
+Searches eBay, Craigslist, Amazon, Walmart, Best Buy, Target, Newegg,
+Mercari, Swappa, AliExpress, and Google Shopping locally without any API
+keys. Results are sorted cheapest → most expensive.
 """
 
 import argparse
 import csv
 import io
 import json
-from difflib import SequenceMatcher
+from rapidfuzz import fuzz as _fuzz
 import logging
 import random
 import re
@@ -34,7 +35,7 @@ from rich.text import Text
 console = Console()
 log = logging.getLogger("dealfindr")
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP helpers
@@ -111,6 +112,142 @@ def _parse_price(text: str) -> Optional[float]:
     return None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Weight / unit conversion
+# ──────────────────────────────────────────────────────────────────────────────
+
+_WEIGHT_TO_OZ = {
+    "lb": 16.0, "lbs": 16.0, "pound": 16.0, "pounds": 16.0,
+    "oz": 1.0, "ounce": 1.0, "ounces": 1.0,
+    "kg": 35.274, "g": 0.03527, "gram": 0.03527, "grams": 0.03527,
+}
+
+_WEIGHT_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*"
+    r"(lb|lbs|pound|pounds|oz|ounce|ounces|kg|g|gram|grams)\b",
+    re.IGNORECASE,
+)
+
+
+def _fmt_num(v: float) -> str:
+    """Format a number: drop decimals if whole, otherwise up to 2 decimal places."""
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def _extract_size(title: str) -> Optional[str]:
+    """Extract weight/size string from a product title and show conversion."""
+    m = _WEIGHT_RE.search(title)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        short = {
+            "pound": "lb", "pounds": "lb", "lbs": "lb",
+            "ounce": "oz", "ounces": "oz",
+            "gram": "g", "grams": "g",
+        }.get(unit, unit)
+        oz_val = val * _WEIGHT_TO_OZ.get(unit, 1.0)
+        if short == "oz" and oz_val >= 4:
+            lb_val = oz_val / 16
+            return f"{_fmt_num(val)} oz ({_fmt_num(lb_val)} lb)"
+        if short == "lb":
+            return f"{_fmt_num(val)} lb ({_fmt_num(val * 16)} oz)"
+        if short == "kg":
+            return f"{_fmt_num(val)} kg ({_fmt_num(oz_val)} oz)"
+        return f"{_fmt_num(val)} {short}"
+    m2 = re.search(r"(\d+)\s*(?:pack|count|ct)\b", title, re.IGNORECASE)
+    if m2:
+        return f"{m2.group(1)} ct"
+    return None
+
+
+def _title_to_oz(title: str) -> Optional[float]:
+    """Extract weight from *title* and normalise to ounces."""
+    m = _WEIGHT_RE.search(title)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    return val * _WEIGHT_TO_OZ.get(unit, 1.0)
+
+
+def _generate_alt_queries(query: str) -> List[str]:
+    """Generate alternate search queries with unit-converted weights.
+
+    e.g. '2lb shelled pistachios' → ['32oz shelled pistachios']
+    """
+    m = _WEIGHT_RE.search(query)
+    if not m:
+        return []
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    original = m.group(0)
+    alts = []
+    if unit in ("lb", "lbs", "pound", "pounds"):
+        alts.append(query.replace(original, f"{_fmt_num(val * 16)}oz", 1))
+    elif unit in ("oz", "ounce", "ounces"):
+        lb_val = val / 16
+        if lb_val >= 0.25:
+            alts.append(query.replace(original, f"{_fmt_num(lb_val)}lb", 1))
+    elif unit == "kg":
+        alts.append(query.replace(original, f"{_fmt_num(val * 2.205)}lb", 1))
+    elif unit in ("g", "gram", "grams"):
+        oz_val = val * 0.03527
+        if oz_val >= 1:
+            alts.append(query.replace(original, f"{_fmt_num(oz_val)}oz", 1))
+    return alts
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JSON utilities (shared by Walmart, Target, Mercari, etc.)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _walk_json_products(data, depth=0):
+    """Walk JSON tree and find dicts that look like product entries."""
+    if depth > 12:
+        return []
+    found = []
+    if isinstance(data, dict):
+        has_name = "name" in data or "title" in data
+        has_price = any(
+            k in data
+            for k in ("price", "currentPrice", "salePrice", "priceInfo", "current_retail")
+        )
+        if has_name and has_price:
+            found.append(data)
+        for v in data.values():
+            found.extend(_walk_json_products(v, depth + 1))
+    elif isinstance(data, list):
+        for item in data:
+            found.extend(_walk_json_products(item, depth + 1))
+    return found
+
+
+def _extract_json_price(item, keys=("price", "currentPrice", "salePrice")):
+    """Extract a numeric price from a JSON product dict."""
+    for key in keys:
+        val = item.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            return float(val)
+        if isinstance(val, str):
+            p = _parse_price(val)
+            if p and p > 0:
+                return p
+        if isinstance(val, dict):
+            for sk in ("price", "min", "current", "value"):
+                sv = val.get(sk)
+                if isinstance(sv, (int, float)) and sv > 0:
+                    return float(sv)
+    pi = item.get("priceInfo", {})
+    if isinstance(pi, dict):
+        for sk in ("currentPrice", "price"):
+            sv = pi.get(sk)
+            if isinstance(sv, (int, float)) and sv > 0:
+                return float(sv)
+    return None
+
+
 _STOP_TOKENS = {
     "a", "an", "the", "for", "with", "to", "from", "and", "or", "on", "in", "of",
     "pack", "new", "used", "sale", "inch", "ft",
@@ -152,9 +289,16 @@ def _passes_intent_filters(title: str, query: str) -> bool:
     if "cable" in query_categories and "cable" not in title_categories:
         return False
 
-    for category in _NOISE_CATEGORIES:
-        if category in title_categories and category not in query_categories:
-            return False
+    # When the title satisfies the primary query intent (e.g., both are
+    # "cable"), noise categories like "display" are harmless — a
+    # "DisplayPort cable" is still a cable.  Only reject noise when the
+    # title does NOT share the primary intent.
+    primary_match = bool(query_categories & title_categories)
+
+    if not primary_match:
+        for category in _NOISE_CATEGORIES:
+            if category in title_categories and category not in query_categories:
+                return False
 
     if "adapter" in title_categories and "adapter" not in query_categories and "cable" in query_categories:
         return False
@@ -195,16 +339,35 @@ def _fuzzy_token_in_title(token: str, title_words: List[str]) -> bool:
     for word in title_words:
         if len(word) < 3:
             continue
-        if SequenceMatcher(None, token, word).ratio() >= 0.75:
+        if _fuzz.ratio(token, word) >= 75:
             return True
     return False
 
 
 def _token_hits_title(token: str, title_l: str, title_words: List[str]) -> bool:
     """Check whether *token* appears in *title_l* (exact substring or fuzzy)."""
+    if token.isdigit() and len(token) <= 2:
+        # Short numbers must match as whole words — "2" must not match "D2" or "ADR6225".
+        return token in title_words
     if token in title_l:
         return True
     return _fuzzy_token_in_title(token, title_words)
+
+
+# Regex to find "word number" version pairs like "thunderbolt 2", "iphone 15", "usb 3.0".
+_VERSION_PHRASE_RE = re.compile(
+    r'\b([a-z]{2,})\s+(\d+(?:\.\d+)?)\b'
+)
+
+
+def _version_phrases(text: str) -> List[Tuple[str, str]]:
+    """Extract product-version pairs like ('thunderbolt', '2'), ('iphone', '15')."""
+    pairs = []
+    for m in _VERSION_PHRASE_RE.finditer(text.lower()):
+        word, num = m.group(1), m.group(2)
+        if word not in _STOP_TOKENS:
+            pairs.append((word, num))
+    return pairs
 
 
 def _is_relevant_title(title: str, query: str) -> bool:
@@ -228,6 +391,13 @@ def _is_relevant_title(title: str, query: str) -> bool:
 
     if _has_contradiction(title, query):
         return False
+
+    # Version phrases (e.g. "thunderbolt 2", "iphone 15") must appear as
+    # adjacent pairs in the title, not just as scattered individual tokens.
+    for word, num in _version_phrases(query):
+        pattern = rf'\b{re.escape(word)}\W*{re.escape(num)}\b'
+        if not re.search(pattern, title_l):
+            return False
 
     tokens = _query_tokens(query)
     if not tokens:
@@ -300,10 +470,19 @@ class Deal:
     condition: str = "Unknown"
     shipping: Optional[float] = None
     location: Optional[str] = None
+    size: Optional[str] = None
+    unit_oz: Optional[float] = None
 
     @property
     def total_price(self) -> float:
         return self.price + (self.shipping or 0.0)
+
+    @property
+    def unit_price(self) -> Optional[float]:
+        """Price per ounce (total including shipping)."""
+        if self.unit_oz and self.unit_oz > 0:
+            return self.total_price / self.unit_oz
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -311,20 +490,73 @@ class Deal:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def search_ebay(query: str, max_results: int = 20) -> List[Deal]:
-    """Buy-It-Now listings sorted by price + shipping (lowest first)."""
+    """Buy-It-Now listings sorted by price + shipping (lowest first).
+
+    Uses Playwright headless browser to bypass eBay bot detection.
+    Falls back to requests if Playwright is unavailable.
+    """
     deals: List[Deal] = []
     url = (
         f"https://www.ebay.com/sch/i.html"
         f"?_nkw={quote_plus(query)}&_sop=15&LH_BIN=1&_ipg=50"
     )
-    resp = _get(url)
-    if not resp:
+
+    html: Optional[str] = None
+
+    # ── Playwright path (preferred) ───────────────────────────────────────────
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: E402
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+            )
+            page = ctx.new_page()
+            page.goto("https://www.ebay.com/", wait_until="domcontentloaded", timeout=12000)
+            time.sleep(1)
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector("div.s-card, li.s-item", timeout=8000)
+            time.sleep(1)
+            html = page.content()
+            browser.close()
+    except Exception as exc:
+        log.debug("Playwright eBay path failed: %s", exc)
+
+    # ── requests fallback ─────────────────────────────────────────────────────
+    if html is None:
+        hdrs = _headers("https://www.ebay.com/")
+        hdrs.update({
+            "sec-ch-ua": '"Chromium";v="123", "Google Chrome";v="123"',
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin",
+        })
+        resp = _get(url, headers=hdrs)
+        if resp:
+            html = resp.text
+
+    if not html:
         return deals
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
-    # eBay now renders result rows as card elements under li[data-view].
-    card_items = soup.select("li[data-view]") or soup.select(".s-item")
+    # eBay uses both old (li.s-item) and new (div.s-card) layouts.
+    card_items = soup.select("div.s-card") or soup.select("li[data-view]") or soup.select(".s-item")
 
     for item in card_items:
         if len(deals) >= max_results:
@@ -415,6 +647,11 @@ _SOURCE_LABELS = {
     "amazon": "Amazon",
     "walmart": "Walmart",
     "bestbuy": "Best Buy",
+    "target": "Target",
+    "newegg": "Newegg",
+    "mercari": "Mercari",
+    "swappa": "Swappa",
+    "aliexpress": "AliExpress",
     "google": "Google Shopping",
 }
 
@@ -579,21 +816,12 @@ def search_craigslist(
 # Amazon scraper
 # ──────────────────────────────────────────────────────────────────────────────
 
-def search_amazon(query: str, max_results: int = 20) -> List[Deal]:
-    """Amazon search sorted by price ascending."""
+def _parse_amazon_results(
+    html: str, query: str, default_condition: str, max_results: int,
+) -> List[Deal]:
+    """Parse Amazon search-result HTML into Deal objects."""
     deals: List[Deal] = []
-    url = f"https://www.amazon.com/s?k={quote_plus(query)}&s=price-asc-rank"
-    resp = _get(url, headers=_headers("https://www.amazon.com/"), timeout=16)
-    if not resp:
-        return deals
-
-    # Detect explicit bot-check pages while avoiding false positives in normal search HTML.
-    lower_text = resp.text.lower()
-    if "captcha" in lower_text or "enter the characters you see below" in lower_text:
-        return deals
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
+    soup = BeautifulSoup(html, "html.parser")
     for result in soup.select('[data-component-type="s-search-result"]'):
         if len(deals) >= max_results:
             break
@@ -627,9 +855,40 @@ def search_amazon(query: str, max_results: int = 20) -> List[Deal]:
             if free_ship:
                 shipping = 0.0
 
-            deals.append(Deal(title[:90], price, link, "Amazon", "New", shipping))
+            # Detect condition from title keywords
+            title_lower = title.lower()
+            if "renewed" in title_lower or "refurbished" in title_lower:
+                condition = "Renewed"
+            elif default_condition == "Used" and "renewed" not in title_lower:
+                condition = "Used"
+            else:
+                condition = default_condition
+
+            deals.append(Deal(title[:90], price, link, "Amazon", condition, shipping))
         except Exception:
             continue
+    return deals
+
+
+def search_amazon(query: str, max_results: int = 20) -> List[Deal]:
+    """Amazon search — new items plus used/renewed offers."""
+    deals: List[Deal] = []
+    seen_urls: set = set()
+    hdrs = _headers("https://www.amazon.com/")
+
+    for condition_filter, default_cond in (("", "New"), ("&condition=used", "Used")):
+        url = f"https://www.amazon.com/s?k={quote_plus(query)}{condition_filter}"
+        resp = _get(url, headers=hdrs, timeout=16)
+        if not resp:
+            continue
+        lower_text = resp.text.lower()
+        if "captcha" in lower_text or "enter the characters you see below" in lower_text:
+            continue
+        batch = _parse_amazon_results(resp.text, query, default_cond, max_results)
+        for deal in batch:
+            if deal.url not in seen_urls:
+                seen_urls.add(deal.url)
+                deals.append(deal)
 
     return deals
 
@@ -865,10 +1124,294 @@ def search_google_shopping(query: str, max_results: int = 20) -> List[Deal]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Target scraper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def search_target(query: str, max_results: int = 20) -> List[Deal]:
+    """Target via Redsky API — returns structured JSON, no scraping needed."""
+    deals: List[Deal] = []
+    api_url = "https://redsky.target.com/redsky_aggregations/v1/web/plp_search_v2"
+    params = {
+        "key": "9f36aeafbe60771e321a7cc95a78140772ab3e96",
+        "channel": "WEB",
+        "count": str(max_results),
+        "default_purchasability_filter": "true",
+        "keyword": query,
+        "offset": "0",
+        "page": f"/s/{query}",
+        "pricing_store_id": "926",
+        "scheduled_delivery_store_id": "926",
+        "store_ids": "926,328,1792,2788",
+        "visitor_id": "018E0000000000000000000000",
+        "zip": "60601",
+    }
+    hdrs = {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Accept": "application/json",
+        "Origin": "https://www.target.com",
+        "Referer": "https://www.target.com/",
+    }
+    resp = _get(api_url, headers=hdrs, params=params, timeout=14)
+    if not resp:
+        return deals
+    try:
+        data = resp.json()
+    except Exception:
+        return deals
+
+    products = (
+        data.get("data", {}).get("search", {}).get("products", [])
+    )
+    for p in products:
+        if len(deals) >= max_results:
+            break
+        try:
+            item = p.get("item", {})
+            price_info = p.get("price", {})
+            desc = item.get("product_description", {})
+            title = (desc.get("title") or "").strip()
+            # Unescape HTML entities (&#38; etc.)
+            title = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), title)
+            if not title or not _is_relevant_title(title, query):
+                continue
+            price = price_info.get("current_retail") or price_info.get(
+                "current_retail_min"
+            )
+            if not price:
+                fmt = str(price_info.get("formatted_current_price", ""))
+                price = _parse_price(fmt)
+            if not price or price <= 0:
+                continue
+            enrichment = item.get("enrichment", {})
+            buy_url = enrichment.get("buy_url", "")
+            link = buy_url or ""
+            deals.append(Deal(title[:90], float(price), link, "Target", "New"))
+        except Exception:
+            continue
+    return deals
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Newegg scraper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def search_newegg(query: str, max_results: int = 20) -> List[Deal]:
+    """Newegg search sorted by price ascending."""
+    deals: List[Deal] = []
+    url = f"https://www.newegg.com/p/pl?d={quote_plus(query)}&Order=PRICE"
+    resp = _get(url, headers=_headers("https://www.newegg.com/"), timeout=16)
+    if not resp:
+        return deals
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for item in soup.select(".item-cell, .item-container"):
+        if len(deals) >= max_results:
+            break
+        try:
+            title_el = item.select_one(".item-title, a.item-title")
+            price_el = item.select_one(".price-current, li.price-current")
+            if not (title_el and price_el):
+                continue
+            title = title_el.get_text(strip=True)
+            if not _is_relevant_title(title, query):
+                continue
+            strong = price_el.select_one("strong")
+            sup = price_el.select_one("sup")
+            if strong:
+                price_str = strong.get_text(strip=True).replace(",", "")
+                if sup:
+                    price_str += sup.get_text(strip=True)
+                price = _parse_price(price_str)
+            else:
+                price = _parse_price(price_el.get_text(strip=True))
+            if not price or price <= 0:
+                continue
+            href = title_el.get("href", "")
+            link = href if href.startswith("http") else f"https://www.newegg.com{href}"
+            shipping = None
+            ship_el = item.select_one(".price-ship, .free-ship")
+            if ship_el:
+                st = ship_el.get_text(strip=True).lower()
+                if "free" in st:
+                    shipping = 0.0
+                else:
+                    sv = _parse_price(st)
+                    if sv is not None:
+                        shipping = sv
+            deals.append(Deal(title[:90], price, link, "Newegg", "New", shipping))
+        except Exception:
+            continue
+    return deals
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mercari scraper  (used marketplace)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def search_mercari(query: str, max_results: int = 20) -> List[Deal]:
+    """Mercari search — Next.js JSON or HTML fallback."""
+    deals: List[Deal] = []
+    url = f"https://www.mercari.com/search/?keyword={quote_plus(query)}&sortBy=2"
+    resp = _get(url, headers=_headers("https://www.mercari.com/"), timeout=16)
+    if not resp:
+        return deals
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script and script.string:
+        try:
+            data = json.loads(script.string)
+            items = _walk_json_products(data)
+            for item in items:
+                if len(deals) >= max_results:
+                    break
+                title = str(item.get("name") or item.get("title") or "").strip()
+                if not title or not _is_relevant_title(title, query):
+                    continue
+                price = _extract_json_price(item)
+                if not price:
+                    continue
+                item_id = item.get("id") or ""
+                link = f"https://www.mercari.com/us/item/{item_id}/" if item_id else ""
+                status = str(item.get("status") or "").lower()
+                if "sold" in status:
+                    continue
+                deals.append(Deal(title[:90], price, link, "Mercari", "Used"))
+        except Exception:
+            pass
+
+    if not deals:
+        for card in soup.select("[data-testid='ItemCell'], [data-testid='SearchResults'] a"):
+            if len(deals) >= max_results:
+                break
+            try:
+                title_el = card.select_one("[data-testid='ItemName'], [role='heading']")
+                price_el = card.select_one("[data-testid='ItemPrice'], .price")
+                if not (title_el and price_el):
+                    continue
+                title = title_el.get_text(strip=True)
+                if not _is_relevant_title(title, query):
+                    continue
+                price = _parse_price(price_el.get_text(strip=True))
+                if not price or price <= 0:
+                    continue
+                href = card.get("href") or ""
+                if not href:
+                    link_el = card.select_one("a[href]")
+                    href = link_el.get("href", "") if link_el else ""
+                link = f"https://www.mercari.com{href}" if href.startswith("/") else href
+                deals.append(Deal(title[:90], price, link, "Mercari", "Used"))
+            except Exception:
+                continue
+    return deals
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Swappa scraper  (verified used electronics)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def search_swappa(query: str, max_results: int = 20) -> List[Deal]:
+    """Swappa search results."""
+    deals: List[Deal] = []
+    url = f"https://swappa.com/search?q={quote_plus(query)}"
+    resp = _get(url, headers=_headers("https://swappa.com/"), timeout=16)
+    if not resp:
+        return deals
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for item in soup.select(".search_result, .listing_row, .search-result-item"):
+        if len(deals) >= max_results:
+            break
+        try:
+            title_el = item.select_one("h3 a, .listing_title a, .item-title a")
+            price_el = item.select_one(".price, .listing_price, .item-price")
+            if not (title_el and price_el):
+                continue
+            title = title_el.get_text(strip=True)
+            if not _is_relevant_title(title, query):
+                continue
+            price = _parse_price(price_el.get_text(strip=True))
+            if not price or price <= 0:
+                continue
+            href = title_el.get("href", "")
+            link = f"https://swappa.com{href}" if href.startswith("/") else href
+            condition = "Used"
+            cond_el = item.select_one(".condition, .listing_condition")
+            if cond_el:
+                ct = cond_el.get_text(strip=True).lower()
+                if "new" in ct or "mint" in ct:
+                    condition = "New"
+            deals.append(Deal(title[:90], price, link, "Swappa", condition))
+        except Exception:
+            continue
+    return deals
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AliExpress scraper  (best-effort, rate-limited)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def search_aliexpress(query: str, max_results: int = 20) -> List[Deal]:
+    """AliExpress search sorted by price ascending."""
+    deals: List[Deal] = []
+    url = f"https://www.aliexpress.com/wholesale?SearchText={quote_plus(query)}&SortType=price_asc"
+    resp = _get(url, headers=_headers("https://www.aliexpress.com/"), timeout=20)
+    if not resp:
+        return deals
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if "searchResult" not in text and "items" not in text:
+            continue
+        for m in re.finditer(r'\{[^{}]*"title"[^{}]*"price"[^{}]*\}', text):
+            if len(deals) >= max_results:
+                break
+            try:
+                item = json.loads(m.group())
+                title = str(item.get("title") or "").strip()
+                if not title or not _is_relevant_title(title, query):
+                    continue
+                price = _extract_json_price(item)
+                if not price:
+                    continue
+                item_id = item.get("productId") or item.get("id") or ""
+                link = f"https://www.aliexpress.com/item/{item_id}.html" if item_id else ""
+                deals.append(Deal(title[:90], price, link, "AliExpress", "New"))
+            except Exception:
+                continue
+
+    if not deals:
+        for card in soup.select(".search-item-card-wrapper-gallery, .list--gallery--C2f2tvm a"):
+            if len(deals) >= max_results:
+                break
+            try:
+                title_el = card.select_one("h3, .multi--titleText--nXeOvyr")
+                price_el = card.select_one(".multi--price-sale--U-S0jtj, .search-card-e-price-main")
+                if not (title_el and price_el):
+                    continue
+                title = title_el.get_text(strip=True)
+                if not _is_relevant_title(title, query):
+                    continue
+                price = _parse_price(price_el.get_text(strip=True))
+                if not price or price <= 0:
+                    continue
+                href = card.get("href") or ""
+                if not href:
+                    link_el = card.select_one("a[href]")
+                    href = link_el.get("href", "") if link_el else ""
+                link = href if href.startswith("http") else f"https://www.aliexpress.com{href}"
+                deals.append(Deal(title[:90], price, link, "AliExpress", "New"))
+            except Exception:
+                continue
+    return deals
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Output
 # ──────────────────────────────────────────────────────────────────────────────
 
-_RANK = {1: "🥇", 2: "🥈", 3: "🥉"}
+_RANK = {1: "[bold gold1]1st[/bold gold1]", 2: "[bold grey74]2nd[/bold grey74]", 3: "[bold orange3]3rd[/bold orange3]"}
 _COND_STYLE = {
     "New":         "bright_green",
     "Refurbished": "cyan",
@@ -886,7 +1429,7 @@ def _dedupe_and_sort(deals: List[Deal]) -> List[Deal]:
         if key not in seen_urls:
             seen_urls.add(key)
             unique.append(d)
-    unique.sort(key=lambda d: d.total_price)
+    unique.sort(key=lambda d: (0, d.unit_price) if d.unit_price is not None else (1, d.total_price))
     return unique
 
 
@@ -922,11 +1465,13 @@ def display_results(deals: List[Deal], query: str) -> None:
         border_style="bright_black",
     )
     table.add_column("#",        width=4,  justify="center")
-    table.add_column("Source",   min_width=16, style="cyan")
-    table.add_column("Cond.",    width=13)
-    table.add_column("Price",    min_width=10, justify="right", style="bold green")
-    table.add_column("Shipping", min_width=12, justify="right")
-    table.add_column("Title",    min_width=38, style="white")
+    table.add_column("Source",   min_width=10, style="cyan")
+    table.add_column("Cond.",    width=6)
+    table.add_column("Price",    min_width=8, justify="right", style="bold green")
+    table.add_column("Shipping", min_width=8, justify="right")
+    table.add_column("Size",     min_width=10, max_width=22)
+    table.add_column("$/oz",     min_width=7,  justify="right", style="bold yellow")
+    table.add_column("Title",    min_width=30, ratio=1, style="white")
 
     cheapest = unique[0].total_price
 
@@ -947,13 +1492,20 @@ def display_results(deals: List[Deal], query: str) -> None:
         else:
             ship_str = f"[yellow]+${d.shipping:.2f}[/yellow]"
 
-        table.add_row(rank, d.source, cond_str, price_str, ship_str, d.title)
+        size_str = f"[dim]{d.size}[/dim]" if d.size else "[dim]—[/dim]"
+
+        if d.unit_price is not None:
+            up_str = f"${d.unit_price:.2f}"
+        else:
+            up_str = "[dim]—[/dim]"
+
+        table.add_row(rank, d.source, cond_str, price_str, ship_str, size_str, up_str, d.title)
 
     console.print(table)
 
     # ── Clickable purchase links ──────────────────────────────────────────────
     console.print()
-    console.print("[bold cyan]Purchase Links — cheapest → most expensive:[/bold cyan]")
+    console.print("[bold cyan]Purchase Links -- best value to most expensive:[/bold cyan]")
     console.print()
     for i, d in enumerate(unique, 1):
         total_str = f"${d.total_price:.2f}"
@@ -976,13 +1528,15 @@ def export_csv(deals: List[Deal], query: str) -> str:
     unique = _dedupe_and_sort(deals)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Rank", "Source", "Condition", "Price", "Shipping", "Total", "Title", "URL"])
+    writer.writerow(["Rank", "Source", "Condition", "Price", "Shipping", "Total", "Size", "$/oz", "Title", "URL"])
     for i, d in enumerate(unique, 1):
         writer.writerow([
             i, d.source, d.condition,
             f"{d.price:.2f}",
             f"{d.shipping:.2f}" if d.shipping is not None else "",
             f"{d.total_price:.2f}",
+            d.size or "",
+            f"{d.unit_price:.2f}" if d.unit_price is not None else "",
             d.title, d.url,
         ])
     return buf.getvalue()
@@ -1006,6 +1560,9 @@ def export_json(deals: List[Deal], query: str) -> str:
                     "condition": d.condition,
                     "url": d.url,
                     "location": d.location,
+                    "size": d.size,
+                    "unit_oz": d.unit_oz,
+                    "unit_price": d.unit_price,
                 }
                 for i, d in enumerate(unique, 1)
             ],
@@ -1036,6 +1593,16 @@ def _build_scrapers(
         scrapers.append(("Walmart",         lambda q=query, n=m: search_walmart(q, n)))
     if "bestbuy" in selected and not args.no_bestbuy:
         scrapers.append(("Best Buy",        lambda q=query, n=m: search_bestbuy(q, n)))
+    if "target" in selected and not getattr(args, 'no_target', False):
+        scrapers.append(("Target",          lambda q=query, n=m: search_target(q, n)))
+    if "newegg" in selected and not getattr(args, 'no_newegg', False):
+        scrapers.append(("Newegg",          lambda q=query, n=m: search_newegg(q, n)))
+    if "mercari" in selected and not getattr(args, 'no_mercari', False):
+        scrapers.append(("Mercari",         lambda q=query, n=m: search_mercari(q, n)))
+    if "swappa" in selected and not getattr(args, 'no_swappa', False):
+        scrapers.append(("Swappa",          lambda q=query, n=m: search_swappa(q, n)))
+    if "aliexpress" in selected and not getattr(args, 'no_aliexpress', False):
+        scrapers.append(("AliExpress",      lambda q=query, n=m: search_aliexpress(q, n)))
     if "google" in selected and not args.no_google:
         scrapers.append(("Google Shopping", lambda q=query, n=m: search_google_shopping(q, n)))
 
@@ -1064,7 +1631,7 @@ examples:
         "--source",
         nargs="+",
         choices=sorted(_SOURCE_LABELS.keys()),
-        help="Only search specific sources (choices: ebay craigslist amazon walmart bestbuy google)",
+        help="Only search specific sources",
     )
     parser.add_argument("--no-ebay", action="store_true", help="Skip eBay")
     parser.add_argument("--no-amazon", action="store_true", help="Skip Amazon")
@@ -1072,6 +1639,11 @@ examples:
     parser.add_argument("--no-walmart", action="store_true", help="Skip Walmart")
     parser.add_argument("--no-bestbuy", action="store_true", help="Skip Best Buy")
     parser.add_argument("--no-google", action="store_true", help="Skip Google Shopping")
+    parser.add_argument("--no-target", action="store_true", help="Skip Target")
+    parser.add_argument("--no-newegg", action="store_true", help="Skip Newegg")
+    parser.add_argument("--no-mercari", action="store_true", help="Skip Mercari")
+    parser.add_argument("--no-swappa", action="store_true", help="Skip Swappa")
+    parser.add_argument("--no-aliexpress", action="store_true", help="Skip AliExpress")
     parser.add_argument(
         "--cities", nargs="+", metavar="CITY",
         help="Craigslist city slugs to search (default: chicago)",
@@ -1126,6 +1698,14 @@ examples:
 
     scrapers = _build_scrapers(query, args)
 
+    # Generate unit-converted alternate queries (e.g. 2lb → 32oz)
+    alt_queries = _generate_alt_queries(query)
+    for alt_q in alt_queries:
+        alt_m = _WEIGHT_RE.search(alt_q)
+        alt_tag = alt_m.group(0) if alt_m else "alt"
+        for name, fn in _build_scrapers(alt_q, args):
+            scrapers.append((f"{name} ({alt_tag})", fn))
+
     if not scrapers:
         parser.error("No sources selected. Remove --no-* flags or use --source with at least one source.")
 
@@ -1154,7 +1734,7 @@ examples:
             for name, _ in scrapers
         }
 
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(scrapers), 12)) as executor:
             futures = {executor.submit(fn): name for name, fn in scrapers}
             for future in as_completed(futures):
                 name = futures[future]
@@ -1174,6 +1754,13 @@ examples:
                         task_map[name],
                         description=f"  [red]✗[/red] {name} [dim](failed)[/dim]",
                     )
+
+    # Post-process: extract size/weight and unit price from titles
+    for d in all_deals:
+        if not d.size:
+            d.size = _extract_size(d.title)
+        if d.unit_oz is None:
+            d.unit_oz = _title_to_oz(d.title)
 
     if args.json:
         print(export_json(all_deals, query))

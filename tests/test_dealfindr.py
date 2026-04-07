@@ -111,9 +111,9 @@ class TestRelevance:
         )
 
     def test_four_token_allows_one_miss(self):
-        # 4 tokens → needs 3
+        # 4 core tokens → needs 3 (no version phrase involved)
         assert dealfindr._is_relevant_title(
-            "Apple Thunderbolt Cable 2m", "apple thunderbolt 2 cable"
+            "Apple Thunderbolt Cable Pro", "apple thunderbolt usb cable"
         )
 
 
@@ -156,6 +156,61 @@ class TestModifierTokens:
         assert dealfindr._is_relevant_title(
             "Wonderful Pistachios Shelled 1lb Bag",
             "2lb shelled pistachios",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Version phrase matching
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestVersionPhrases:
+    def test_extracts_thunderbolt_2(self):
+        pairs = dealfindr._version_phrases("thunderbolt 2 cable")
+        assert ("thunderbolt", "2") in pairs
+
+    def test_extracts_iphone_15(self):
+        pairs = dealfindr._version_phrases("iphone 15 pro max")
+        assert ("iphone", "15") in pairs
+
+    def test_extracts_usb_3_0(self):
+        pairs = dealfindr._version_phrases("usb 3.0 cable")
+        assert ("usb", "3.0") in pairs
+
+    def test_no_phrase_for_ps5(self):
+        # "ps5" has no space → no version phrase detected
+        pairs = dealfindr._version_phrases("ps5")
+        assert len(pairs) == 0
+
+    def test_skips_stop_words(self):
+        # "for 2" → "for" is a stop word, shouldn't be a version phrase
+        pairs = dealfindr._version_phrases("cable for 2 devices")
+        assert not any(w == "for" for w, n in pairs)
+
+    def test_thunderbolt_2_rejects_thunderbolt_3(self):
+        assert not dealfindr._is_relevant_title(
+            "StarTech.com Thunderbolt 3 Cable 2m", "thunderbolt 2 cable"
+        )
+
+    def test_thunderbolt_2_rejects_usb_for_tb_drive(self):
+        assert not dealfindr._is_relevant_title(
+            "White USB 3.0 Sync Data Cable for LACIE D2 2 Thunderbolt External Hard Drive",
+            "thunderbolt 2 cable",
+        )
+
+    def test_thunderbolt_2_accepts_actual_tb2(self):
+        assert dealfindr._is_relevant_title(
+            "Apple Thunderbolt 2 Cable 0.5m", "thunderbolt 2 cable"
+        )
+
+    def test_usb_3_rejects_usb_2(self):
+        assert not dealfindr._is_relevant_title(
+            "USB 2.0 Type A Cable 6ft", "usb 3 cable"
+        )
+
+    def test_usb_3_accepts_usb_3_0(self):
+        assert dealfindr._is_relevant_title(
+            "USB 3.0 Type A Cable 6ft", "usb 3 cable"
         )
 
 
@@ -431,7 +486,15 @@ class TestEbayParser:
     @patch("dealfindr._get")
     def test_parses_two_items(self, mock_get):
         mock_get.return_value = _mock_response(self.MINIMAL_EBAY_HTML)
-        deals = dealfindr.search_ebay("apple thunderbolt 2 cable", max_results=10)
+        # Force requests fallback by making Playwright import fail
+        import builtins
+        _real_import = builtins.__import__
+        def _block_pw(name, *a, **kw):
+            if "playwright" in name:
+                raise ImportError("blocked for test")
+            return _real_import(name, *a, **kw)
+        with patch("builtins.__import__", side_effect=_block_pw):
+            deals = dealfindr.search_ebay("apple thunderbolt 2 cable", max_results=10)
         assert len(deals) == 2
         assert deals[0].source == "eBay"
         assert deals[0].price == 14.99
@@ -441,13 +504,27 @@ class TestEbayParser:
     @patch("dealfindr._get")
     def test_returns_empty_on_failure(self, mock_get):
         mock_get.return_value = None
-        deals = dealfindr.search_ebay("anything")
+        import builtins
+        _real_import = builtins.__import__
+        def _block_pw(name, *a, **kw):
+            if "playwright" in name:
+                raise ImportError("blocked for test")
+            return _real_import(name, *a, **kw)
+        with patch("builtins.__import__", side_effect=_block_pw):
+            deals = dealfindr.search_ebay("anything")
         assert deals == []
 
     @patch("dealfindr._get")
     def test_strips_tracking_from_url(self, mock_get):
         mock_get.return_value = _mock_response(self.MINIMAL_EBAY_HTML)
-        deals = dealfindr.search_ebay("apple thunderbolt 2 cable")
+        import builtins
+        _real_import = builtins.__import__
+        def _block_pw(name, *a, **kw):
+            if "playwright" in name:
+                raise ImportError("blocked for test")
+            return _real_import(name, *a, **kw)
+        with patch("builtins.__import__", side_effect=_block_pw):
+            deals = dealfindr.search_ebay("apple thunderbolt 2 cable")
         for d in deals:
             assert "?" not in d.url
             assert "hash=" not in d.url
@@ -469,9 +546,11 @@ class TestAmazonParser:
     def test_parses_one_item(self, mock_get):
         mock_get.return_value = _mock_response(self.MINIMAL_AMAZON_HTML)
         deals = dealfindr.search_amazon("apple thunderbolt 2 cable", max_results=10)
+        # Both passes return same URL → deduped to 1 deal (first pass = New)
         assert len(deals) == 1
         assert deals[0].price == 19.99
         assert deals[0].source == "Amazon"
+        assert deals[0].condition == "New"
         assert "/dp/B00P0GHXNI" in deals[0].url
 
     @patch("dealfindr._get")
@@ -481,6 +560,21 @@ class TestAmazonParser:
         )
         deals = dealfindr.search_amazon("anything")
         assert deals == []
+
+    def test_renewed_condition_detection(self):
+        html = """
+        <html><body>
+        <div data-component-type="s-search-result">
+          <h2><span>Apple iPhone 13, 128GB, Midnight - Unlocked (Renewed)</span></h2>
+          <a class="a-link-normal s-no-outline" href="/dp/B09LNW3CY2/ref=sr_1"></a>
+          <span class="a-price-whole">269</span>
+          <span class="a-price-fraction">00</span>
+        </div>
+        </body></html>
+        """
+        deals = dealfindr._parse_amazon_results(html, "iphone 13", "Used", 10)
+        assert len(deals) == 1
+        assert deals[0].condition == "Renewed"
 
 
 class TestWalmartParser:
@@ -544,3 +638,235 @@ class TestThreadSafety:
 
         assert len(sessions) == 2
         assert sessions[0] is not sessions[1]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Weight / unit conversion
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestFmtNum:
+    def test_whole_number(self):
+        assert dealfindr._fmt_num(32.0) == "32"
+
+    def test_decimal(self):
+        assert dealfindr._fmt_num(2.5) == "2.5"
+
+    def test_trailing_zeros(self):
+        assert dealfindr._fmt_num(1.10) == "1.1"
+
+
+class TestExtractSize:
+    def test_lb_with_conversion(self):
+        result = dealfindr._extract_size("Wonderful Pistachios 2lb Bag")
+        assert result is not None
+        assert "2 lb" in result
+        assert "32 oz" in result
+
+    def test_oz_with_conversion(self):
+        result = dealfindr._extract_size("Pistachios 32oz Resealable")
+        assert result is not None
+        assert "32 oz" in result
+        assert "2 lb" in result
+
+    def test_kg(self):
+        result = dealfindr._extract_size("Organic Nuts 1kg Bag")
+        assert result is not None
+        assert "1 kg" in result
+
+    def test_count(self):
+        result = dealfindr._extract_size("K-Cups 24 Count Box")
+        assert result == "24 ct"
+
+    def test_no_weight(self):
+        assert dealfindr._extract_size("Apple Thunderbolt 2 Cable") is None
+
+    def test_small_oz_no_lb_conversion(self):
+        # Under 4oz should not show lb conversion
+        result = dealfindr._extract_size("Sample Pack 2oz")
+        assert result is not None
+        assert "lb" not in result
+
+
+class TestGenerateAltQueries:
+    def test_lb_to_oz(self):
+        alts = dealfindr._generate_alt_queries("2lb shelled pistachios")
+        assert len(alts) == 1
+        assert "32oz" in alts[0]
+        assert "shelled pistachios" in alts[0]
+
+    def test_oz_to_lb(self):
+        alts = dealfindr._generate_alt_queries("32oz shelled pistachios")
+        assert len(alts) == 1
+        assert "2lb" in alts[0]
+        assert "shelled pistachios" in alts[0]
+
+    def test_kg_to_lb(self):
+        alts = dealfindr._generate_alt_queries("1kg almonds")
+        assert len(alts) == 1
+        assert "lb" in alts[0]
+
+    def test_no_weight(self):
+        alts = dealfindr._generate_alt_queries("iphone 15 pro max")
+        assert alts == []
+
+    def test_small_oz_no_conversion(self):
+        # 2oz = 0.125lb, below 0.25 threshold
+        alts = dealfindr._generate_alt_queries("2oz sample")
+        assert alts == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JSON utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestWalkJsonProducts:
+    def test_finds_product(self):
+        data = {"items": [{"name": "Widget", "price": 9.99}]}
+        found = dealfindr._walk_json_products(data)
+        assert len(found) == 1
+        assert found[0]["name"] == "Widget"
+
+    def test_deeply_nested(self):
+        data = {"a": {"b": {"c": [{"name": "Deep", "price": 5}]}}}
+        found = dealfindr._walk_json_products(data)
+        assert len(found) == 1
+
+    def test_empty_data(self):
+        assert dealfindr._walk_json_products({}) == []
+        assert dealfindr._walk_json_products([]) == []
+
+
+class TestExtractJsonPrice:
+    def test_numeric_price(self):
+        assert dealfindr._extract_json_price({"price": 19.99}) == 19.99
+
+    def test_string_price(self):
+        assert dealfindr._extract_json_price({"price": "$14.99"}) == 14.99
+
+    def test_nested_price(self):
+        assert dealfindr._extract_json_price({"price": {"min": 12.50}}) == 12.50
+
+    def test_price_info_fallback(self):
+        assert dealfindr._extract_json_price({"priceInfo": {"currentPrice": 8.0}}) == 8.0
+
+    def test_no_price(self):
+        assert dealfindr._extract_json_price({"title": "No price here"}) is None
+
+    def test_custom_keys(self):
+        assert dealfindr._extract_json_price(
+            {"current_retail": 24.99}, keys=("current_retail",)
+        ) == 24.99
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Source labels expansion
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestSourceLabels:
+    def test_all_eleven_sources(self):
+        assert len(dealfindr._SOURCE_LABELS) == 11
+
+    def test_new_sources_present(self):
+        for key in ("target", "newegg", "mercari", "swappa", "aliexpress"):
+            assert key in dealfindr._SOURCE_LABELS
+
+    def test_parse_source_new_sources(self):
+        sel = dealfindr._parse_source_selection("target newegg")
+        assert "target" in sel
+        assert "newegg" in sel
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Deal size field
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestDealSize:
+    def test_size_default_none(self):
+        d = dealfindr.Deal("Item", 10.0, "http://x", "eBay")
+        assert d.size is None
+
+    def test_size_set(self):
+        d = dealfindr.Deal("Item", 10.0, "http://x", "eBay", size="2 lb (32 oz)")
+        assert d.size == "2 lb (32 oz)"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _title_to_oz
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestTitleToOz:
+    def test_oz(self):
+        assert dealfindr._title_to_oz("Almonds 12 oz bag") == pytest.approx(12.0)
+
+    def test_lb(self):
+        assert dealfindr._title_to_oz("Pistachios 2 lb") == pytest.approx(32.0)
+
+    def test_kg(self):
+        assert dealfindr._title_to_oz("Coffee 1 kg") == pytest.approx(35.274)
+
+    def test_grams(self):
+        assert dealfindr._title_to_oz("Spice 100g") == pytest.approx(3.527)
+
+    def test_no_weight(self):
+        assert dealfindr._title_to_oz("Bluetooth Speaker") is None
+
+    def test_count_returns_none(self):
+        assert dealfindr._title_to_oz("Batteries 12 pack") is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unit price property & sort order
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestUnitPrice:
+    def test_unit_price_computed(self):
+        d = dealfindr.Deal("Nuts 16oz", 16.0, "http://x", "Amazon", unit_oz=16.0)
+        assert d.unit_price == pytest.approx(1.0)
+
+    def test_unit_price_includes_shipping(self):
+        d = dealfindr.Deal("Nuts 16oz", 16.0, "http://x", "Amazon", shipping=4.0, unit_oz=16.0)
+        assert d.unit_price == pytest.approx(1.25)
+
+    def test_unit_price_none_without_oz(self):
+        d = dealfindr.Deal("Nuts", 10.0, "http://x", "Amazon")
+        assert d.unit_price is None
+
+    def test_sort_by_unit_price(self):
+        """Deals with unit_price sort by $/oz; deals without sort by total last."""
+        expensive_per_oz = dealfindr.Deal("Small 6oz", 6.0, "http://a", "A", unit_oz=6.0)   # $1.00/oz
+        cheap_per_oz = dealfindr.Deal("Big 32oz", 22.0, "http://b", "B", unit_oz=32.0)       # $0.69/oz
+        no_size_cheap = dealfindr.Deal("Mystery", 3.0, "http://c", "C")                       # no unit
+
+        result = dealfindr._dedupe_and_sort([expensive_per_oz, no_size_cheap, cheap_per_oz])
+        assert result[0].title == "Big 32oz"          # $0.69/oz — best value
+        assert result[1].title == "Small 6oz"          # $1.00/oz
+        assert result[2].title == "Mystery"            # no unit price, sorted last
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Export with size field
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestExportWithSize:
+    def test_csv_includes_size(self):
+        deals = [dealfindr.Deal("Pistachios 2lb", 15.99, "http://x", "Amazon", size="2 lb (32 oz)", unit_oz=32.0)]
+        csv_str = dealfindr.export_csv(deals, "pistachios")
+        assert "Size" in csv_str
+        assert "2 lb (32 oz)" in csv_str
+        assert "$/oz" in csv_str
+        assert "0.50" in csv_str  # $15.99/32oz ≈ $0.50
+
+    def test_json_includes_size(self):
+        deals = [dealfindr.Deal("Pistachios 2lb", 15.99, "http://x", "Amazon", size="2 lb (32 oz)", unit_oz=32.0)]
+        json_str = dealfindr.export_json(deals, "pistachios")
+        data = json.loads(json_str)
+        assert data["deals"][0]["size"] == "2 lb (32 oz)"
+        assert data["deals"][0]["unit_oz"] == 32.0
+        assert data["deals"][0]["unit_price"] == pytest.approx(15.99 / 32.0)
