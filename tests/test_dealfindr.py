@@ -128,13 +128,26 @@ class TestDealfindrCronFilters:
     def test_amazon_shipping_unknown_keeps_listed_price(self):
         d = dealfindr.Deal(
             "Bizzy Organic Unsweetened Espresso Blend Cold Brew Coffee, 48 fl oz",
-            4.99,
+            3.99,
             "https://amazon.com/dp/123",
             "Amazon",
             shipping=None,  # Amazon search pages may omit shipping until checkout
         )
         d.unit_oz = 48.0
         assert dealfindr_cron._filter(d)
+
+    @pytest.mark.parametrize("price", [4.99, 4.79, 4.50])
+    def test_shelf_price_bottle_rejected(self, price):
+        # $4.99-ish is everyday shelf price for a 48oz bottle, not a deal.
+        d = dealfindr.Deal(
+            "Starbucks Cold Brew Black Unsweetened, 48 fl oz",
+            price,
+            "https://walmart.com/ip/123",
+            "Walmart",
+            shipping=0.0,
+        )
+        d.unit_oz = 48.0
+        assert not dealfindr_cron._filter(d)
 
     def test_amazon_free_shipping_valid_pass(self):
         d = dealfindr.Deal(

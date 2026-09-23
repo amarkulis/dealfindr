@@ -12,8 +12,9 @@ Environment variables (see k8s/configmap.yaml + secret.yaml):
   DEALFINDR_BRANDS        Comma-separated brand allowlist
                           (default: "La Colombe,Bizzy,Starbucks,Califia")
   DEALFINDR_MIN_SIZE_OZ   Minimum total volume in fl oz (default: 48)
-  DEALFINDR_MAX_PRICE     Maximum total price (price + shipping) in USD
-                          (default: 5.0)
+  DEALFINDR_MAX_PRICE     Bottled price cap (price + shipping) in USD; a deal
+                          must be strictly below it (default: 4.50 — $4.99 is
+                          regular shelf price for 48oz, not a deal)
   DEALFINDR_MAX_RESULTS   Max results per source        (default: 40)
   DISCORD_WEBHOOK_URL     Discord webhook for the dealfindr channel (secret)
 """
@@ -494,9 +495,9 @@ try:
 except ValueError:
     MIN_SIZE_OZ = 48.0
 try:
-    MAX_PRICE = float(os.getenv("DEALFINDR_MAX_PRICE", "5.0"))
+    MAX_PRICE = float(os.getenv("DEALFINDR_MAX_PRICE", "4.50"))
 except ValueError:
-    MAX_PRICE = 5.0
+    MAX_PRICE = 4.50
 try:
     MAX_PRICE_PER_CAN = float(os.getenv("DEALFINDR_MAX_PRICE_PER_CAN", "1.0"))
 except ValueError:
@@ -864,10 +865,8 @@ def _filter(deal: Deal) -> bool:
     if not _is_black_coffee(deal.title):
         return False
 
-    # Check for canned/pack deals — must be explicit cans, black coffee, and < $1/can.
+    # Check for canned/pack deals — must be explicit cans and < $1/can.
     if _is_canned(deal.title):
-        if not _is_black_coffee(deal.title):
-            return False
         can_count = _extract_can_count(deal.title)
         if can_count and can_count > 0:
             price_per_can = deal.total_price / can_count
