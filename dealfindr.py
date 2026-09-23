@@ -51,14 +51,24 @@ _USER_AGENTS = [
 
 
 def _headers(referer: str = "") -> dict:
+    # Full Chrome browser headers (Sec-Ch-Ua / Sec-Fetch-*) are required to
+    # avoid bot-detection pages from Walmart and other retailers. A bare UA
+    # (or Firefox/Safari UA) triggers a 15KB challenge page instead of the
+    # real search results.
     h = {
-        "User-Agent": random.choice(_USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "DNT": "1",
+        "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     }
     if referer:
         h["Referer"] = referer
@@ -103,7 +113,9 @@ def _parse_price(text: str) -> Optional[float]:
     """Extract the first dollar-amount from a string."""
     if not text:
         return None
-    m = re.search(r"\$?\s*([\d,]+(?:\.\d{1,2})?)", text.replace(",", ""))
+    # Normalize multiple decimal dots (e.g., "4..99" -> "4.99")
+    cleaned = re.sub(r"\.+", ".", text.replace(",", ""))
+    m = re.search(r"\$?\s*([\d]+(?:\.\d{1,2})?)", cleaned)
     if m:
         try:
             return float(m.group(1))
@@ -464,7 +476,7 @@ def _has_contradiction(title: str, query: str) -> bool:
 @dataclass
 class Deal:
     title: str
-    price: float
+    price: Optional[float]
     url: str
     source: str
     condition: str = "Unknown"
@@ -474,13 +486,15 @@ class Deal:
     unit_oz: Optional[float] = None
 
     @property
-    def total_price(self) -> float:
+    def total_price(self) -> Optional[float]:
+        if self.price is None:
+            return None
         return self.price + (self.shipping or 0.0)
 
     @property
     def unit_price(self) -> Optional[float]:
         """Price per ounce (total including shipping)."""
-        if self.unit_oz and self.unit_oz > 0:
+        if self.unit_oz and self.unit_oz > 0 and self.total_price is not None:
             return self.total_price / self.unit_oz
         return None
 
@@ -837,9 +851,9 @@ def _parse_amazon_results(
             title = title_el.get_text(strip=True)
             if not _is_relevant_title(title, query):
                 continue
-            price_str = whole.get_text(strip=True).replace(",", "")
+            price_str = whole.get_text(strip=True).replace(",", "").rstrip(".")
             if frac:
-                price_str += "." + frac.get_text(strip=True)
+                price_str += "." + frac.get_text(strip=True).strip()
 
             price = _parse_price(price_str)
             if not price or price <= 0:

@@ -12,6 +12,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import dealfindr
+import dealfindr_cron
+import router_dealfindr
+
+
+class TestRouterBt10Filter:
+    def test_only_asus_bt10_titles_pass(self):
+        assert router_dealfindr._is_bt10_title("ASUS ZenWiFi BT10 WiFi 7 Router")
+        assert router_dealfindr._is_bt10_title("ZenWiFi BT10")
+        assert not router_dealfindr._is_bt10_title("ASUS RT-BE92U BE18000 WiFi 7 Router")
+        assert not router_dealfindr._is_bt10_title("Netgear Nighthawk WiFi 7 Router")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -34,6 +44,10 @@ class TestParsePrice:
 
     def test_with_extra_text(self):
         assert dealfindr._parse_price("Price: $14.99 + shipping") == 14.99
+
+    def test_double_dots(self):
+        assert dealfindr._parse_price("4..99") == 4.99
+        assert dealfindr._parse_price("3..00") == 3.00
 
     def test_free(self):
         # "Free" has no digits so should return None
@@ -64,9 +78,86 @@ class TestDeal:
         d = dealfindr.Deal("Item", 10.0, "http://x", "eBay", shipping=None)
         assert d.total_price == 10.0
 
+    def test_total_price_none_price(self):
+        d = dealfindr.Deal("Item", None, "http://x", "eBay", shipping=5.0)
+        assert d.total_price is None
+        assert d.unit_price is None
+
     def test_default_condition(self):
         d = dealfindr.Deal("Item", 10.0, "http://x", "eBay")
         assert d.condition == "Unknown"
+
+
+class TestAmazonProductPriceFallback:
+    def test_bot_page_no_price_does_not_crash(self):
+        d = dealfindr.Deal("Bizzy cold brew", 3.99, "https://www.amazon.com/dp/B000000000", "Amazon")
+        with patch.object(dealfindr_cron, "_get", return_value=None):
+            assert dealfindr_cron._check_amazon_product_discount(d) is None
+
+
+class TestDealfindrCronFilters:
+    def test_kcup_pods_rejected(self):
+        d = dealfindr.Deal(
+            "Green Mountain Coffee Roasters, Original Black Iced Cold Brew K-Cup Coffee Pods, 10 Count",
+            9.39,
+            "https://walmart.com/ip/123",
+            "Walmart",
+        )
+        assert not dealfindr_cron._filter(d)
+
+    def test_creamer_rejected(self):
+        d = dealfindr.Deal(
+            "Chobani Creamer 24-52 oz La Colombe Cold Brew 42 oz EA TONY'S REWARDS WHEN YOU BUY 2",
+            3.99,
+            "https://flipp.com/123",
+            "Flipp (Tony's Fresh Market)",
+            shipping=0.0,
+        )
+        d.unit_oz = 52.0
+        assert not dealfindr_cron._filter(d)
+
+    def test_unvetted_brand_rejected(self):
+        d = dealfindr.Deal(
+            "Loco Coffee Black Cold Brew 11 Ounce Can, 12 Count",
+            9.04,
+            "https://walmart.com/ip/123",
+            "Walmart",
+        )
+        assert not dealfindr_cron._filter(d)
+
+    def test_amazon_shipping_unknown_keeps_listed_price(self):
+        d = dealfindr.Deal(
+            "Bizzy Organic Unsweetened Espresso Blend Cold Brew Coffee, 48 fl oz",
+            4.99,
+            "https://amazon.com/dp/123",
+            "Amazon",
+            shipping=None,  # Amazon search pages may omit shipping until checkout
+        )
+        d.unit_oz = 48.0
+        assert dealfindr_cron._filter(d)
+
+    def test_amazon_free_shipping_valid_pass(self):
+        d = dealfindr.Deal(
+            "Bizzy Organic Unsweetened Espresso Blend Cold Brew Coffee, 48 fl oz",
+            4.49,
+            "https://amazon.com/dp/123",
+            "Amazon",
+            shipping=0.0,
+        )
+        d.unit_oz = 48.0
+        assert dealfindr_cron._filter(d)
+
+    def test_canned_cold_brew_valid_pass(self):
+        d = dealfindr.Deal(
+            "Bizzy Organic Cold Brew Coffee, 12 Cans",
+            10.00,
+            "https://amazon.com/dp/123",
+            "Amazon",
+            shipping=0.0,
+        )
+        assert dealfindr_cron._is_canned(d.title)
+        assert dealfindr_cron._extract_can_count(d.title) == 12
+        assert dealfindr_cron._filter(d)  # 10.00 / 12 = $0.83/can < $1.00
 
 
 # ──────────────────────────────────────────────────────────────────────────────

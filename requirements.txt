@@ -4,3 +4,4 @@ rich>=13.7.0
 lxml>=5.1.0
 rapidfuzz>=3.0.0
 playwright>=1.40.0
+curl_cffi>=0.7.0
