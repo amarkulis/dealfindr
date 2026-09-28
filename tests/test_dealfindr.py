@@ -88,6 +88,23 @@ class TestDeal:
         assert d.condition == "Unknown"
 
 
+class TestAmazonCouponOrdering:
+    def test_search_card_coupon_survives_product_page_check(self, monkeypatch):
+        d = dealfindr.Deal(
+            "Bizzy Organic Unsweetened Cold Brew Coffee, 48 fl oz",
+            4.99, "https://www.amazon.com/dp/B0TESTTEST", "Amazon", shipping=0.0,
+        )
+        coupons = {"B0TESTTEST": {"label": "You pay $3.99", "pct_off": None}}
+        sent = []
+        monkeypatch.setattr(dealfindr_cron, "_search_all", lambda: ([d], coupons))
+        # Product page reports a different price and can't see the coupon.
+        monkeypatch.setattr(dealfindr_cron, "_check_amazon_product_discount", lambda deal: 5.29)
+        monkeypatch.setattr(dealfindr_cron, "_send_discord", sent.extend)
+        monkeypatch.setattr(dealfindr_cron, "_close_browser", lambda: None)
+        dealfindr_cron.main()
+        assert [m.price for m in sent] == [3.99]
+
+
 class TestAmazonProductPriceFallback:
     def test_bot_page_no_price_does_not_crash(self):
         d = dealfindr.Deal("Bizzy cold brew", 3.99, "https://www.amazon.com/dp/B000000000", "Amazon")

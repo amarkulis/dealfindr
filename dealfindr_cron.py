@@ -15,6 +15,7 @@ Environment variables (see k8s/configmap.yaml + secret.yaml):
                           must be strictly below it (default: 4.50 — $4.99 is
                           regular shelf price for 48oz, not a deal)
   DEALFINDR_MAX_RESULTS   Max results per source        (default: 40)
+  DEALFINDR_AMAZON_ZIP    Amazon delivery ZIP           (default: 60480)
   DISCORD_WEBHOOK_URL     Discord webhook for the dealfindr channel (secret)
 """
 
@@ -281,13 +282,10 @@ def _amazon_get(url: str, timeout: int = 16):
     Amazon's cookies from the search pages to the product pages, like a
     browser would.
     """
-    global _amazon_session
     if cffi_requests is None:
         return _get(url, headers=_headers("https://www.amazon.com/"), timeout=timeout)
-    if _amazon_session is None:
-        _amazon_session = cffi_requests.Session(impersonate="chrome")
     try:
-        resp = _amazon_session.get(url, timeout=timeout)
+        resp = _get_amazon_session().get(url, timeout=timeout)
     except Exception as exc:
         _log(f"  [amazon] GET failed: {exc}")
         return None
@@ -295,6 +293,67 @@ def _amazon_get(url: str, timeout: int = 16):
         _log(f"  [amazon] HTTP {resp.status_code} for {url[:80]}")
         return None
     return resp
+
+
+def _get_amazon_session():
+    global _amazon_session
+    if _amazon_session is None:
+        _amazon_session = cffi_requests.Session(impersonate="chrome")
+    return _amazon_session
+
+
+# Runs on amazon.com: fetch a CSRF token via the "Deliver to" popup's data
+# endpoint, then POST the ZIP the same way the popup does.
+_AMAZON_SET_ZIP_JS = """async (zip) => {
+  const el = document.querySelector('#nav-global-location-data-modal-action');
+  const modal = JSON.parse(el.getAttribute('data-a-modal'));
+  const r = await fetch(modal.url, {headers: modal.ajaxHeaders || {}});
+  const m = (await r.text()).match(/CSRF_TOKEN\\s*:\\s*"([^"]+)"/);
+  if (!m) return {error: 'no CSRF token', status: r.status};
+  const r2 = await fetch('/portal-migration/hz/glow/address-change?actionSource=glow', {
+    method: 'POST',
+    headers: {'anti-csrftoken-a2z': m[1], 'content-type': 'application/json'},
+    body: JSON.stringify({locationType: 'LOCATION_INPUT', zipCode: zip, deviceType: 'web',
+                          storeContext: 'generic', pageType: 'Gateway', actionSource: 'glow'}),
+  });
+  const text = await r2.text();
+  try { return JSON.parse(text); } catch (e) { return {error: text.slice(0, 200), status: r2.status}; }
+}"""
+
+
+def _set_amazon_location(zip_code: str) -> bool:
+    """Set Amazon's delivery ZIP and copy the session cookies into _amazon_session.
+
+    Without a ZIP, Amazon renders grocery items as unshippable, so product-page
+    prices and coupons can't be trusted. The location endpoints sit behind an
+    AWS WAF JavaScript challenge plain HTTP clients can't pass, so this runs in
+    the shared headless browser; Amazon stores the ZIP server-side against the
+    session cookies, which carry over to curl_cffi.
+    """
+    if not zip_code or cffi_requests is None:
+        return False
+    try:
+        context = _get_browser().new_context(user_agent=_BROWSER_UA, locale="en-US")
+        try:
+            page = context.new_page()
+            page.goto("https://www.amazon.com/", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_selector("#nav-global-location-data-modal-action", state="attached", timeout=25000)
+            result = page.evaluate(_AMAZON_SET_ZIP_JS, zip_code)
+            cookies = context.cookies("https://www.amazon.com")
+        finally:
+            context.close()
+    except Exception as exc:
+        _log(f"  [amazon] could not set delivery ZIP {zip_code}: {exc}")
+        return False
+    if not (isinstance(result, dict) and result.get("successful")):
+        _log(f"  [amazon] could not set delivery ZIP {zip_code}: {result}")
+        return False
+    session = _get_amazon_session()
+    for c in cookies:
+        session.cookies.set(c["name"], c["value"], domain=c["domain"])
+    city = (result.get("address") or {}).get("city", "")
+    _log(f"  [amazon] delivery ZIP set to {zip_code} ({city})")
+    return True
 
 
 def _search_amazon_with_coupons(query: str, max_results: int = 40) -> tuple:
@@ -402,13 +461,18 @@ def _check_amazon_product_discount(deal: Deal) -> Optional[float]:
             or "this item cannot be shipped" in page_lower
         )
         if location_warning:
-            # The pod's Amazon session has no user's ZIP/address cookie. This
-            # message reflects the cluster's default location, not the buyer's.
+            # Only expected when _set_amazon_location failed: the message then
+            # reflects Amazon's default location, not the buyer's.
             _log(f"  [amazon] {asin}: delivery location not verified; keeping listed price")
 
+        # Read stock status from the #availability block only. The phrase
+        # "Currently unavailable." is also in a UI-string table embedded in
+        # every product page, so a whole-page search always matches.
+        availability = soup.select_one("#availability")
+        availability_text = availability.get_text(" ", strip=True).lower() if availability else ""
         if (
-            "currently unavailable" in page_lower
-            or "we don't know when or if this item will be back in stock" in page_lower
+            "currently unavailable" in availability_text
+            or "we don't know when or if this item will be back in stock" in availability_text
         ):
             # Product pages can select a different variant or inherit the
             # cluster's location. Preserve the search-card price, which is the
@@ -537,6 +601,9 @@ try:
 except ValueError:
     MAX_RESULTS = 40
 
+# Amazon delivery ZIP (Willow Springs, IL). Empty disables location setup.
+AMAZON_ZIP = os.getenv("DEALFINDR_AMAZON_ZIP", "60480").strip()
+
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 # When true, post a short "no deals found" heartbeat to Discord on quiet days
@@ -564,6 +631,12 @@ EXTRA_QUERIES = [
 
 # Shared browser instance — launched once per run, reused across searches.
 _browser: Optional[Browser] = None
+
+# Headless Chromium's default UA says "HeadlessChrome"; present as desktop Chrome.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def _get_browser() -> Browser:
@@ -969,8 +1042,11 @@ def _send_discord(matches: List[Deal]) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _search_all() -> List[Deal]:
+def _search_all() -> tuple:
     """Run all store searches — Walmart/Flipp in parallel, Amazon/Target sequentially.
+
+    Returns (deals, amazon_coupons). Coupons are applied by main() only after
+    product-page price checks, which would otherwise overwrite them.
 
     Google Shopping and Craigslist were dropped: Google serves a JS wall or
     CAPTCHA to every non-browser/headless client, and Craigslist has no
@@ -1001,6 +1077,7 @@ def _search_all() -> List[Deal]:
                 _log(f"  {label} FAILED: {exc}")
 
     # Phase 2: Amazon sequentially with delays + coupon extraction.
+    _set_amazon_location(AMAZON_ZIP)
     all_coupons: dict = {}
     for i, q in enumerate(queries):
         if i > 0:
@@ -1014,11 +1091,6 @@ def _search_all() -> List[Deal]:
         except Exception as exc:  # noqa: BLE001
             _log(f"  {label} FAILED: {exc}")
 
-    # Apply coupons to Amazon deals (adjusts prices for S&S, annotates promos).
-    if all_coupons:
-        _log(f"Applying coupons: {len(all_coupons)} total")
-        all_deals = _apply_coupons_to_deals(all_deals, all_coupons)
-
     # Phase 3: Target via Playwright, sequentially (not thread-safe).
     for q in queries:
         label = f"search_target_pw({q!r})"
@@ -1029,7 +1101,7 @@ def _search_all() -> List[Deal]:
         except Exception as exc:  # noqa: BLE001
             _log(f"  {label} FAILED: {exc}")
 
-    return all_deals
+    return all_deals, all_coupons
 
 
 def _dedup(deals: List[Deal]) -> List[Deal]:
@@ -1071,7 +1143,7 @@ def main() -> None:
     _log("=" * 60)
 
     try:
-        raw_deals = _search_all()
+        raw_deals, amazon_coupons = _search_all()
         _log(f"Total raw deals: {len(raw_deals)}")
 
         # Post-process size/unit_oz (replicate dealfindr.py main() lines 1761-1763).
@@ -1098,6 +1170,13 @@ def main() -> None:
                     d.price = real_price
             except Exception as exc:
                 _log(f"  [amazon] discount check failed for {d.title[:60]}: {exc}")
+
+        # Search-card clip coupons ("You pay $X"). Applied after the product-page
+        # check because Amazon loads the product page's coupon box with JS, so
+        # the verified price there never includes the coupon.
+        if amazon_coupons:
+            _log(f"Applying coupons: {len(amazon_coupons)} total")
+            _apply_coupons_to_deals(unique, amazon_coupons)
 
         # Filter.
         matches = [d for d in unique if _filter(d)]
