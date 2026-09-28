@@ -91,7 +91,7 @@ class TestDeal:
 class TestAmazonProductPriceFallback:
     def test_bot_page_no_price_does_not_crash(self):
         d = dealfindr.Deal("Bizzy cold brew", 3.99, "https://www.amazon.com/dp/B000000000", "Amazon")
-        with patch.object(dealfindr_cron, "_get", return_value=None):
+        with patch.object(dealfindr_cron, "_amazon_get", return_value=None):
             assert dealfindr_cron._check_amazon_product_discount(d) is None
 
 

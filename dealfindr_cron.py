@@ -3,9 +3,8 @@
 dealfindr_cron.py — Cron entry point for daily cold-brew coffee deal alerts.
 
 Runs as a Kubernetes CronJob on the TC cluster. Searches Amazon, Walmart,
-Target, Google Shopping, and Craigslist (Chicago metro / 60480) for cold-brew
-coffee, filters by brand / size / price, and posts any matches to a Discord
-webhook.
+Target, and local grocery weekly ads (Flipp) for cold-brew coffee, filters by
+brand / size / price, and posts any matches to a Discord webhook.
 
 Environment variables (see k8s/configmap.yaml + secret.yaml):
   DEALFINDR_QUERY         Base search query            (default: "cold brew coffee")
@@ -34,6 +33,11 @@ from urllib.parse import quote_plus
 import requests
 from playwright.sync_api import sync_playwright, Browser
 
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:  # pragma: no cover - listed in requirements.txt
+    cffi_requests = None
+
 # Import the deal-finding machinery from the main module.
 from dealfindr import (
     Deal,
@@ -43,7 +47,6 @@ from dealfindr import (
     _parse_amazon_results,
     _parse_price,
     _title_to_oz,
-    search_craigslist,
     search_walmart,
 )
 
@@ -266,6 +269,34 @@ def _parse_amazon_full(html: str, max_results: int = 40) -> List[Deal]:
     return deals
 
 
+_amazon_session = None
+
+
+def _amazon_get(url: str, timeout: int = 16):
+    """GET an Amazon page with a real Chrome TLS fingerprint; None unless HTTP 200.
+
+    Plain `requests` sends Chrome headers over a Python TLS handshake, and
+    from the cluster's IP Amazon answered about half of those with HTTP 503.
+    curl_cffi impersonates Chrome's handshake. One shared session carries
+    Amazon's cookies from the search pages to the product pages, like a
+    browser would.
+    """
+    global _amazon_session
+    if cffi_requests is None:
+        return _get(url, headers=_headers("https://www.amazon.com/"), timeout=timeout)
+    if _amazon_session is None:
+        _amazon_session = cffi_requests.Session(impersonate="chrome")
+    try:
+        resp = _amazon_session.get(url, timeout=timeout)
+    except Exception as exc:
+        _log(f"  [amazon] GET failed: {exc}")
+        return None
+    if resp.status_code != 200:
+        _log(f"  [amazon] HTTP {resp.status_code} for {url[:80]}")
+        return None
+    return resp
+
+
 def _search_amazon_with_coupons(query: str, max_results: int = 40) -> tuple:
     """Search Amazon and return (deals, coupons_dict).
 
@@ -275,7 +306,6 @@ def _search_amazon_with_coupons(query: str, max_results: int = 40) -> tuple:
     deals: list = []
     coupons: dict = {}
     seen_urls: set = set()
-    hdrs = _headers("https://www.amazon.com/")
 
     for condition_filter, default_cond in (("", "New"), ("&condition=used", "Used")):
         url = f"https://www.amazon.com/s?k={quote_plus(query)}{condition_filter}"
@@ -284,7 +314,7 @@ def _search_amazon_with_coupons(query: str, max_results: int = 40) -> tuple:
         for attempt in range(2):
             if attempt:
                 time.sleep(2.0)
-            resp = _get(url, headers=_headers("https://www.amazon.com/"), timeout=16)
+            resp = _amazon_get(url, timeout=16)
             if not resp:
                 continue
             lower_text = resp.text.lower()
@@ -347,7 +377,7 @@ def _check_amazon_product_discount(deal: Deal) -> Optional[float]:
             return None
 
         url = f"https://www.amazon.com/dp/{asin}"
-        resp = _get(url, headers=_headers("https://www.amazon.com/"), timeout=12)
+        resp = _amazon_get(url, timeout=12)
         if not resp:
             _log(f"  [amazon] {asin}: no response")
             return None
@@ -360,7 +390,7 @@ def _check_amazon_product_discount(deal: Deal) -> Optional[float]:
         if not soup.select_one(".a-offscreen") and not soup.select_one(".a-price-whole"):
             _log(f"  [amazon] {asin}: bot page (len={len(resp.text)}), retrying")
             time.sleep(1.5)
-            resp = _get(url, headers=_headers("https://www.amazon.com/"), timeout=12)
+            resp = _amazon_get(url, timeout=12)
             if not resp:
                 _log(f"  [amazon] {asin}: no response on retry")
                 return None
@@ -528,9 +558,6 @@ EXTRA_QUERIES = [
     "canned cold brew coffee",
 ]
 
-# Craigslist cities near 60480 (Willow Springs, IL — Chicago metro).
-CL_CITIES = ["chicago"]
-
 # --------------------------------------------------------------------------- #
 # Playwright-based scrapers (for JS-rendered sites)
 # --------------------------------------------------------------------------- #
@@ -625,81 +652,6 @@ def search_target_playwright(query: str, max_results: int = 20) -> List[Deal]:
         _log(f"  search_target_playwright({query!r}) error: {exc}")
     return deals
 
-
-def search_google_shopping_playwright(query: str, max_results: int = 20) -> List[Deal]:
-    """Google Shopping via headless Chromium.
-
-    NOTE: Google frequently serves reCAPTCHA to headless browsers, especially
-    from datacenter/container IPs. When blocked, this returns 0 results silently.
-    """
-    deals: List[Deal] = []
-    url = f"https://www.google.com/search?q={requests.utils.quote(query)}&tbm=shop&hl=en&gl=us"
-    try:
-        browser = _get_browser()
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            locale="en-US",
-        )
-        try:
-            page = context.new_page()
-            try:
-                page.set_default_timeout(20000)
-                page.goto(url, wait_until="networkidle")
-                page.wait_for_timeout(3000)
-
-                # Check for CAPTCHA
-                body_text = (page.inner_text("body") or "").lower()
-                if "captcha" in body_text or "not a robot" in body_text:
-                    _log(f"    [google] CAPTCHA detected — skipping")
-                    return deals
-
-                # Try multiple selector patterns for product cards
-                cards = page.query_selector_all(".sh-dgr__content, .sh-dlr__list-result, div[data-sh-d]")
-                if not cards:
-                    cards = page.query_selector_all(".mnr-c")
-                if not cards:
-                    cards = page.query_selector_all("div[data-sh-dgr]")
-                _log(f"    [google] cards: {len(cards)}")
-
-                for card in cards[:max_results]:
-                    try:
-                        title_el = card.query_selector("h3, .tAxDx, .EI11Pd, .sh-np__product-title")
-                        price_el = card.query_selector(".a8Pemb, .kHxwFf, .HRLxBb, .T14wmb")
-                        link_el = card.query_selector("a[href]")
-                        store_el = card.query_selector(".aULzUe, .LbUacb, .shntl, .IuHnof")
-
-                        if not title_el or not price_el:
-                            continue
-                        title = (title_el.inner_text() or "").strip()
-                        price = _parse_price((price_el.inner_text() or "").strip())
-                        if not price or price <= 0:
-                            continue
-
-                        href = link_el.get_attribute("href") if link_el else ""
-                        link = ""
-                        if href:
-                            if href.startswith("/url?"):
-                                m = re.search(r"[?&]q=([^&]+)", href)
-                                link = requests.utils.unquote(m.group(1)) if m else href
-                            elif href.startswith("http"):
-                                link = href
-                            else:
-                                link = f"https://www.google.com{href}"
-
-                        store = (store_el.inner_text() or "").strip() if store_el else ""
-                        source = f"Google Shopping ({store})" if store else "Google Shopping"
-
-                        deals.append(Deal(title[:90], price, link, source, "New"))
-                    except Exception:
-                        continue
-            finally:
-                page.close()
-        finally:
-            context.close()
-    except Exception as exc:
-        _log(f"  search_google_shopping_playwright({query!r}) error: {exc}")
-    return deals
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -1018,17 +970,21 @@ def _send_discord(matches: List[Deal]) -> None:
 
 
 def _search_all() -> List[Deal]:
-    """Run all store searches — Walmart/Craigslist in parallel, Amazon/Target/Google sequentially."""
+    """Run all store searches — Walmart/Flipp in parallel, Amazon/Target sequentially.
+
+    Google Shopping and Craigslist were dropped: Google serves a JS wall or
+    CAPTCHA to every non-browser/headless client, and Craigslist has no
+    cold-brew listings (its scraper works; there's just nothing to find).
+    """
     queries = _build_queries()
     _log(f"Searching {len(queries)} query(ies): {queries}")
 
     all_deals: List[Deal] = []
 
-    # Phase 1: Walmart + Craigslist + Flipp in parallel (thread-safe, no rate-limit issues).
+    # Phase 1: Walmart + Flipp in parallel (thread-safe, no rate-limit issues).
     req_tasks: List[tuple] = []
     for q in queries:
         req_tasks.append((f"search_walmart({q!r})", lambda q=q: search_walmart(q, MAX_RESULTS)))
-        req_tasks.append((f"search_craigslist({q!r})", lambda q=q: search_craigslist(q, cities=CL_CITIES, max_results=MAX_RESULTS)))
     # Flipp runs once with its own brand-name query list (_FLIPP_QUERIES);
     # passing our "X cold brew" queries returns nothing from Flipp's API.
     req_tasks.append(("search_flipp(brands)", lambda: search_flipp()))
@@ -1063,18 +1019,15 @@ def _search_all() -> List[Deal]:
         _log(f"Applying coupons: {len(all_coupons)} total")
         all_deals = _apply_coupons_to_deals(all_deals, all_coupons)
 
-    # Phase 3: Playwright-based scrapers sequentially (not thread-safe).
+    # Phase 3: Target via Playwright, sequentially (not thread-safe).
     for q in queries:
-        for label, fn in [
-            (f"search_target_pw({q!r})", lambda q=q: search_target_playwright(q, MAX_RESULTS)),
-            (f"search_google_pw({q!r})", lambda q=q: search_google_shopping_playwright(q, MAX_RESULTS)),
-        ]:
-            try:
-                results = fn()
-                _log(f"  {label} -> {len(results)} raw deal(s)")
-                all_deals.extend(results)
-            except Exception as exc:  # noqa: BLE001
-                _log(f"  {label} FAILED: {exc}")
+        label = f"search_target_pw({q!r})"
+        try:
+            results = search_target_playwright(q, MAX_RESULTS)
+            _log(f"  {label} -> {len(results)} raw deal(s)")
+            all_deals.extend(results)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  {label} FAILED: {exc}")
 
     return all_deals
 
