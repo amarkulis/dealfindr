@@ -566,6 +566,24 @@ def _close_browser() -> None:
         _browser = None
 
 
+_TARGET_PRICE_RE = re.compile(r'\$\d+(?:\.\d{2})?')
+
+
+def _parse_target_price_text(card_text: str) -> Optional[str]:
+    """Return the card's leading price ("$2.19"), or None.
+
+    Card text starts with the price line, e.g. "$2.19 ($0.20/fluid ounce)".
+    Price ranges ("$4.49 - $8.99") span variants of different sizes, so the
+    low end may not be the size in the title — skip them.
+    """
+    for line in card_text.splitlines():
+        line = re.sub(r'\([^)]*\)', '', line)  # drop "($0.20/fluid ounce)"
+        prices = _TARGET_PRICE_RE.findall(line)
+        if prices:
+            return prices[0] if len(prices) == 1 else None
+    return None
+
+
 def search_target_playwright(query: str, max_results: int = 20) -> List[Deal]:
     """Target.com search via headless Chromium — renders JS product cards."""
     deals: List[Deal] = []
@@ -578,27 +596,27 @@ def search_target_playwright(query: str, max_results: int = 20) -> List[Deal]:
             page.goto(url, wait_until="domcontentloaded")
             page.wait_for_timeout(5000)
 
-            # Target product cards use data-test="product-details" wrapper.
-            cards = page.query_selector_all('[data-test="product-details"]')
+            # Target product cards (2026 layout): data-test="ListingPageProductListing".
+            cards = page.query_selector_all('[data-test="ListingPageProductListing"]')
             _log(f"    [target] cards: {len(cards)}")
 
             for card in cards[:max_results]:
                 try:
-                    # Title: <a data-test="@web/ProductCard/title">
-                    title_el = card.query_selector('a[data-test="@web/ProductCard/title"]')
-                    # Price: <span data-test="current-price">
-                    price_el = card.query_selector('span[data-test="current-price"]')
-
-                    if not title_el or not price_el:
+                    # Title + link: <a data-test="content" aria-label="<full title>" href="/p/...">
+                    title_el = card.query_selector('a[data-test="content"]')
+                    if not title_el:
                         continue
-                    title = (title_el.inner_text() or "").strip()
-                    price = _parse_price((price_el.inner_text() or "").strip())
+                    title = (title_el.get_attribute("aria-label") or "").strip()
+                    price_text = _parse_target_price_text(card.inner_text() or "")
+                    if not title or price_text is None:
+                        continue
+                    price = _parse_price(price_text)
                     if not price or price <= 0:
                         continue
                     href = title_el.get_attribute("href") or ""
                     link = f"https://www.target.com{href}" if href.startswith("/") else href
 
-                    deals.append(Deal(title[:90], price, link, "Target", "New"))
+                    deals.append(Deal(title[:120], price, link, "Target", "New"))
                 except Exception:
                     continue
         finally:
@@ -732,6 +750,12 @@ def _is_canned(title: str) -> bool:
     return bool(_CAN_KEYWORD_RE.search(title))
 
 
+_CAN_SIZE_RE = re.compile(
+    r'\d+(?:\.\d+)?\s*-?\s*(?:fl\.?\s*oz|fluid\s*ounces?|ounces?|oz|ml)\b',
+    re.IGNORECASE,
+)
+
+
 def _extract_can_count(title: str) -> Optional[int]:
     """Extract the number of cans from a product title.
 
@@ -740,14 +764,14 @@ def _extract_can_count(title: str) -> Optional[int]:
     """
     if not _is_canned(title):
         return None
-    # "12 cans", "12 Cans", "Pack of 12 cans", "12-pack 11 fl oz cans"
-    m = re.search(r'(\d+)\s*[-/]?\s*(?:pack|pk)?\s*(?:of\s*)?(\d+)?\s*(?:fl\.?\s*oz\s*)?cans?\b', title, re.IGNORECASE)
-    if m:
-        return int(m.group(2) or m.group(1))
-    m = re.search(r'Pack\s*(?:of|size)?\s*(\d+)', title, re.IGNORECASE)
+    # Drop per-can sizes first so "11 fl oz Can" isn't read as 11 cans.
+    stripped = _CAN_SIZE_RE.sub(" ", title)
+    # "12 cans", "12-pack", "12 x cans", "12 Count"
+    m = re.search(r'(\d+)\s*(?:[-/x×]\s*)?(?:pack|pk|count|ct|cans?)\b', stripped, re.IGNORECASE)
     if m:
         return int(m.group(1))
-    m = re.search(r'(\d+)\s*[-/]?\s*(?:can|ct|count|pack)s?\b', title, re.IGNORECASE)
+    # "Pack of 12", "Pack Size: 12"
+    m = re.search(r'Pack\s*(?:of|size)?\s*:?\s*(\d+)', stripped, re.IGNORECASE)
     if m:
         return int(m.group(1))
     return None
@@ -884,6 +908,20 @@ def _filter(deal: Deal) -> bool:
     return True
 
 
+def _is_price_near_miss(deal: Deal) -> bool:
+    """True for a brand-matched black bottle >= MIN_SIZE_OZ rejected only on price."""
+    return (
+        deal.total_price is not None
+        and deal.total_price >= MAX_PRICE
+        and not _is_canned(deal.title)
+        and not _is_non_rtd(deal.title)
+        and _matches_brand(deal.title)
+        and _is_black_coffee(deal.title)
+        and deal.unit_oz is not None
+        and deal.unit_oz >= MIN_SIZE_OZ
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Discord
 # --------------------------------------------------------------------------- #
@@ -991,7 +1029,9 @@ def _search_all() -> List[Deal]:
     for q in queries:
         req_tasks.append((f"search_walmart({q!r})", lambda q=q: search_walmart(q, MAX_RESULTS)))
         req_tasks.append((f"search_craigslist({q!r})", lambda q=q: search_craigslist(q, cities=CL_CITIES, max_results=MAX_RESULTS)))
-        req_tasks.append((f"search_flipp({q!r})", lambda q=q: search_flipp(q)))
+    # Flipp runs once with its own brand-name query list (_FLIPP_QUERIES);
+    # passing our "X cold brew" queries returns nothing from Flipp's API.
+    req_tasks.append(("search_flipp(brands)", lambda: search_flipp()))
 
     with ThreadPoolExecutor(max_workers=min(len(req_tasks), 8)) as pool:
         futures = {pool.submit(fn): label for label, fn in req_tasks}
@@ -1109,6 +1149,13 @@ def main() -> None:
         # Filter.
         matches = [d for d in unique if _filter(d)]
         _log(f"Matches (brand + size + price): {len(matches)}")
+
+        # Log the cheapest bottles that failed only on price, so a quiet day
+        # can be told apart from scrapers returning nothing relevant.
+        near = sorted((d for d in unique if _is_price_near_miss(d)), key=lambda d: d.total_price)
+        _log(f"Near misses (bottled, >= ${MAX_PRICE:.2f}): {len(near)}")
+        for d in near[:10]:
+            _log(f"  ${d.total_price:.2f} | {d.unit_oz:.0f} fl oz | {d.source} | {d.title[:70]}")
 
         # Sort by unit price ascending (best deal first).
         # For canned deals without unit_oz, sort by price_per_can.

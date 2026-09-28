@@ -149,6 +149,38 @@ class TestDealfindrCronFilters:
         d.unit_oz = 48.0
         assert not dealfindr_cron._filter(d)
 
+    def test_shelf_price_bottle_is_near_miss(self):
+        d = dealfindr.Deal("Starbucks Cold Brew Black Unsweetened, 48 fl oz", 4.99, "u", "Walmart", shipping=0.0)
+        d.unit_oz = 48.0
+        assert dealfindr_cron._is_price_near_miss(d)
+        d.price = 3.99
+        assert not dealfindr_cron._is_price_near_miss(d)
+
+    @pytest.mark.parametrize("text,expected", [
+        ("$2.19 ($0.20/fluid ounce)\nCOSTA COFFEE Iced Coffee - 11 fl oz", "$2.19"),
+        ("$2.49\nNew at \nStarbucks RTD Iced Energy - 12 fl oz", "$2.49"),
+        ("$4.49 - $8.99\nStarbucks Cold Brew - 32 or 48 fl oz", None),
+        ("Starbucks Cold Brew - 48 fl oz\nAdd to cart", None),
+    ])
+    def test_target_price_text(self, text, expected):
+        assert dealfindr_cron._parse_target_price_text(text) == expected
+
+    @pytest.mark.parametrize("title,expected", [
+        ("Bizzy Organic Cold Brew Coffee, 12 Cans", 12),
+        ("La Colombe Black Coffee Cold Brew - 11 fl oz Can", None),
+        ("La Colombe Cold Brew 12 pack 11 fl oz cans", 12),
+        ("Starbucks Black Cold Brew 11 Ounce Can, 12 Count", 12),
+        ("Starbucks Cold Brew 12 x 11oz cans", 12),
+        ("La Colombe Cold Brew Cans, Pack of 8", 8),
+    ])
+    def test_can_count(self, title, expected):
+        assert dealfindr_cron._extract_can_count(title) == expected
+
+    def test_single_can_rejected(self):
+        d = dealfindr.Deal("La Colombe Black Coffee Cold Brew - 11 fl oz Can", 2.89, "u", "Target")
+        d.unit_oz = 11.0
+        assert not dealfindr_cron._filter(d)
+
     def test_amazon_free_shipping_valid_pass(self):
         d = dealfindr.Deal(
             "Bizzy Organic Unsweetened Espresso Blend Cold Brew Coffee, 48 fl oz",
