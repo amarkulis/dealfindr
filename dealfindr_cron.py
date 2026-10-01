@@ -11,9 +11,9 @@ Environment variables (see k8s/configmap.yaml + secret.yaml):
   DEALFINDR_BRANDS        Comma-separated brand allowlist
                           (default: "La Colombe,Bizzy,Starbucks,Califia")
   DEALFINDR_MIN_SIZE_OZ   Minimum total volume in fl oz (default: 48)
-  DEALFINDR_MAX_PRICE     Bottled price cap (price + shipping) in USD; a deal
-                          must be strictly below it (default: 4.50 — $4.99 is
-                          regular shelf price for 48oz, not a deal)
+  DEALFINDR_MAX_PRICE     Bottled price cap (price + shipping) in USD, inclusive
+                          (default: 4.50 — $4.99 is regular shelf price for
+                          48oz, not a deal)
   DEALFINDR_MAX_RESULTS   Max results per source        (default: 40)
   DEALFINDR_AMAZON_ZIP    Amazon delivery ZIP           (default: 60480)
   DISCORD_WEBHOOK_URL     Discord webhook for the dealfindr channel (secret)
@@ -337,6 +337,12 @@ def _set_amazon_location(zip_code: str) -> bool:
         try:
             page = context.new_page()
             page.goto("https://www.amazon.com/", wait_until="domcontentloaded", timeout=30000)
+            # Amazon sometimes shows a plain "Continue shopping" click-through
+            # page instead of the homepage; click it like a visitor would.
+            cont = page.query_selector('button:has-text("Continue shopping")')
+            if cont:
+                cont.click()
+                page.wait_for_load_state("domcontentloaded")
             page.wait_for_selector("#nav-global-location-data-modal-action", state="attached", timeout=25000)
             result = page.evaluate(_AMAZON_SET_ZIP_JS, zip_code)
             cookies = context.cookies("https://www.amazon.com")
@@ -684,13 +690,26 @@ def _parse_target_price_text(card_text: str) -> Optional[str]:
     return None
 
 
+# Set once Target's bot protection (PerimeterX) rejects the results API;
+# the remaining queries would be rejected too, so they're skipped.
+_target_blocked = False
+
+
 def search_target_playwright(query: str, max_results: int = 20) -> List[Deal]:
     """Target.com search via headless Chromium — renders JS product cards."""
+    global _target_blocked
     deals: List[Deal] = []
+    if _target_blocked:
+        return deals
     url = f"https://www.target.com/s?searchTerm={requests.utils.quote(query)}&sortBy=PriceLow"
     try:
         browser = _get_browser()
         page = browser.new_page()
+        # The page shell always loads; results come from the plp_search API,
+        # which PerimeterX answers with HTTP 4xx (435) when it flags the client.
+        api_errors: List[int] = []
+        page.on("response", lambda r: api_errors.append(r.status)
+                if "plp_search" in r.url and r.status >= 400 else None)
         try:
             page.set_default_timeout(20000)
             page.goto(url, wait_until="domcontentloaded")
@@ -699,6 +718,10 @@ def search_target_playwright(query: str, max_results: int = 20) -> List[Deal]:
             # Target product cards (2026 layout): data-test="ListingPageProductListing".
             cards = page.query_selector_all('[data-test="ListingPageProductListing"]')
             _log(f"    [target] cards: {len(cards)}")
+            if not cards and api_errors:
+                _target_blocked = True
+                _log(f"    [target] BLOCKED by bot protection (HTTP {api_errors[0]}); "
+                     "skipping remaining Target searches")
 
             for card in cards[:max_results]:
                 try:
@@ -776,7 +799,7 @@ def _is_canned(title: str) -> bool:
 
 
 _CAN_SIZE_RE = re.compile(
-    r'\d+(?:\.\d+)?\s*-?\s*(?:fl\.?\s*oz|fluid\s*ounces?|ounces?|oz|ml)\b',
+    r'\d+(?:\.\d+)?\s*-?\s*(?:fl\.?\s*oz|fluid\s*ounces?|fz|ounces?|oz|ml)\b',
     re.IGNORECASE,
 )
 
@@ -831,7 +854,7 @@ def _is_black_coffee(title: str) -> bool:
 
 
 # Regex for fluid ounce patterns that _WEIGHT_RE misses.
-_FL_OZ_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(?:fl\.?\s*oz|fluid\s*ounces?)\b', re.IGNORECASE)
+_FL_OZ_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(?:fl\.?\s*oz|fluid\s*ounces?|fz)\b', re.IGNORECASE)
 
 
 def _extract_fl_oz(title: str) -> Optional[float]:
@@ -928,7 +951,7 @@ def _filter(deal: Deal) -> bool:
     # Amazon search pages frequently omit shipping until the buyer selects a
     # delivery address. Keep the listed item price; the Discord message shows
     # shipping as N/A rather than treating the pod's location as authoritative.
-    if deal.total_price >= MAX_PRICE:
+    if deal.total_price > MAX_PRICE:
         return False
     return True
 
@@ -937,7 +960,7 @@ def _is_price_near_miss(deal: Deal) -> bool:
     """True for a brand-matched black bottle >= MIN_SIZE_OZ rejected only on price."""
     return (
         deal.total_price is not None
-        and deal.total_price >= MAX_PRICE
+        and deal.total_price > MAX_PRICE
         and not _is_canned(deal.title)
         and not _is_non_rtd(deal.title)
         and _matches_brand(deal.title)
@@ -1002,7 +1025,7 @@ def _send_discord(matches: List[Deal]) -> None:
 
     header = (
         f"☕ **DealFindr** found {len(matches)} cold-brew deal(s)!\n"
-        f"Bottled: {MIN_SIZE_OZ:.0f}oz+ under ${MAX_PRICE:.2f} | "
+        f"Bottled: {MIN_SIZE_OZ:.0f}oz+ at ${MAX_PRICE:.2f} or less | "
         f"Canned: under ${MAX_PRICE_PER_CAN:.2f}/can\n\n"
     )
     chunks: List[str] = []
@@ -1185,7 +1208,7 @@ def main() -> None:
         # Log the cheapest bottles that failed only on price, so a quiet day
         # can be told apart from scrapers returning nothing relevant.
         near = sorted((d for d in unique if _is_price_near_miss(d)), key=lambda d: d.total_price)
-        _log(f"Near misses (bottled, >= ${MAX_PRICE:.2f}): {len(near)}")
+        _log(f"Near misses (bottled, over ${MAX_PRICE:.2f}): {len(near)}")
         for d in near[:10]:
             _log(f"  ${d.total_price:.2f} | {d.unit_oz:.0f} fl oz | {d.source} | {d.title[:70]}")
 

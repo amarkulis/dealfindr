@@ -153,7 +153,7 @@ class TestDealfindrCronFilters:
         d.unit_oz = 48.0
         assert dealfindr_cron._filter(d)
 
-    @pytest.mark.parametrize("price", [4.99, 4.79, 4.50])
+    @pytest.mark.parametrize("price", [4.99, 4.79, 4.51])
     def test_shelf_price_bottle_rejected(self, price):
         # $4.99-ish is everyday shelf price for a 48oz bottle, not a deal.
         d = dealfindr.Deal(
@@ -165,6 +165,16 @@ class TestDealfindrCronFilters:
         )
         d.unit_oz = 48.0
         assert not dealfindr_cron._filter(d)
+
+    def test_amazon_fz_bottle_at_cap_passes(self):
+        # Amazon grocery titles abbreviate fluid ounces as "FZ"; the cap is inclusive.
+        d = dealfindr.Deal(
+            "La Colombe Medium Roast Cold Brew Coffee, 48 FZ",
+            4.50, "https://www.amazon.com/dp/B0TESTTEST", "Amazon",
+        )
+        dealfindr_cron._post_process(d)
+        assert d.unit_oz == 48.0
+        assert dealfindr_cron._filter(d)
 
     def test_shelf_price_bottle_is_near_miss(self):
         d = dealfindr.Deal("Starbucks Cold Brew Black Unsweetened, 48 fl oz", 4.99, "u", "Walmart", shipping=0.0)
