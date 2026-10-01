@@ -337,13 +337,24 @@ def _set_amazon_location(zip_code: str) -> bool:
         try:
             page = context.new_page()
             page.goto("https://www.amazon.com/", wait_until="domcontentloaded", timeout=30000)
-            # Amazon sometimes shows a plain "Continue shopping" click-through
-            # page instead of the homepage; click it like a visitor would.
-            cont = page.query_selector('button:has-text("Continue shopping")')
-            if cont:
-                cont.click()
-                page.wait_for_load_state("domcontentloaded")
-            page.wait_for_selector("#nav-global-location-data-modal-action", state="attached", timeout=25000)
+            # Amazon may first serve a WAF JS check that reloads the page, then
+            # a plain "Continue shopping" click-through, either of which can
+            # appear after the initial load. Poll, clicking through like a
+            # visitor, until the homepage's location popup data is present.
+            deadline = time.time() + 25
+            while True:
+                try:
+                    if page.query_selector("#nav-global-location-data-modal-action"):
+                        break
+                    cont = page.query_selector('button:has-text("Continue shopping")')
+                    if cont:
+                        cont.click()
+                        page.wait_for_load_state("domcontentloaded")
+                except Exception:
+                    pass  # page navigated mid-query; check again
+                if time.time() > deadline:
+                    raise TimeoutError("homepage location popup never appeared")
+                page.wait_for_timeout(1000)
             result = page.evaluate(_AMAZON_SET_ZIP_JS, zip_code)
             cookies = context.cookies("https://www.amazon.com")
         finally:
