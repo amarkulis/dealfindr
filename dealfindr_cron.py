@@ -9,7 +9,7 @@ brand / size / price, and posts any matches to a Discord webhook.
 Environment variables (see k8s/configmap.yaml + secret.yaml):
   DEALFINDR_QUERY         Base search query            (default: "cold brew coffee")
   DEALFINDR_BRANDS        Comma-separated brand allowlist
-                          (default: "La Colombe,Bizzy,Starbucks,Califia")
+                          (default: "La Colombe,Bizzy,Starbucks,Califia,Stok,Dunkin")
   DEALFINDR_MIN_SIZE_OZ   Minimum total volume in fl oz (default: 48)
   DEALFINDR_MAX_PRICE     Bottled price cap (price + shipping) in USD, inclusive
                           (default: 4.50 — $4.99 is regular shelf price for
@@ -81,6 +81,7 @@ _FLIPP_QUERIES = [
     "La Colombe",
     "Califia",
     "Bizzy",
+    "Dunkin",
     "coffee",
 ]
 
@@ -599,7 +600,7 @@ def _apply_coupons_to_deals(deals: list, coupons: dict) -> list:
 # --------------------------------------------------------------------------- #
 
 QUERY = os.getenv("DEALFINDR_QUERY", "cold brew coffee").strip()
-BRANDS_RAW = os.getenv("DEALFINDR_BRANDS", "La Colombe,Bizzy,Starbucks,Califia,Stok,Stōk").strip()
+BRANDS_RAW = os.getenv("DEALFINDR_BRANDS", "La Colombe,Bizzy,Starbucks,Califia,Stok,Stōk,Dunkin").strip()
 BRANDS = [b.strip().lower() for b in BRANDS_RAW.split(",") if b.strip()]
 try:
     MIN_SIZE_OZ = float(os.getenv("DEALFINDR_MIN_SIZE_OZ", "48"))
@@ -635,6 +636,7 @@ BRAND_QUERIES = {
     "bizzy": "Bizzy cold brew",
     "starbucks": "Starbucks cold brew",
     "califia": "Califia cold brew",
+    "dunkin": "Dunkin cold brew",
 }
 
 # Extra queries for specific product formats.
@@ -851,6 +853,7 @@ _BLACK_COFFEE_BLACKLIST = [
     "lightly sweetened", "sweetened", "honey", "maple", "cinnamon",
     "protein", "cream", "creamer", "frappuccino", "macchiato",
     "cappuccino", "cortado", "flat white",
+    "pumpkin", "flavored",
 ]
 
 
@@ -862,6 +865,42 @@ def _is_black_coffee(title: str) -> bool:
         if re.search(r'\b' + re.escape(term) + r'\b', title_lower):
             return False
     return True
+
+
+# Cold brew concentrates are mixed with equal parts water, so a bottle makes
+# twice its volume.
+CONCENTRATE_DILUTION = 2.0
+
+_CONCENTRATE_RE = re.compile(r'\bconcentrated?\b', re.IGNORECASE)
+
+
+def _is_concentrate(title: str) -> bool:
+    """True if the title describes a coffee concentrate."""
+    return bool(_CONCENTRATE_RE.search(title))
+
+
+def _prepared_oz(deal: Deal) -> Optional[float]:
+    """Volume in fl oz once ready to drink (concentrates are diluted)."""
+    if deal.unit_oz is None:
+        return None
+    if _is_concentrate(deal.title):
+        return deal.unit_oz * CONCENTRATE_DILUTION
+    return deal.unit_oz
+
+
+def _bottle_price_cap(deal: Deal) -> float:
+    """Price cap for a bottled deal.
+
+    Regular bottles use MAX_PRICE. Concentrates get the same price per
+    prepared ounce as a MIN_SIZE_OZ bottle at MAX_PRICE, e.g. a 31 fl oz
+    concentrate (62 fl oz prepared) is capped at $5.81 with the defaults.
+    """
+    if not _is_concentrate(deal.title):
+        return MAX_PRICE
+    prepared = _prepared_oz(deal)
+    if prepared is None:
+        return MAX_PRICE
+    return round(MAX_PRICE * prepared / MIN_SIZE_OZ, 2)
 
 
 # Regex for fluid ounce patterns that _WEIGHT_RE misses.
@@ -929,7 +968,8 @@ def _filter(deal: Deal) -> bool:
     """Apply the brand + size/price filter.
 
     Two deal types are supported:
-    1. Bottled/jug: must match an allowed brand, be >= MIN_SIZE_OZ, and total_price < MAX_PRICE.
+    1. Bottled/jug: must match an allowed brand, be >= MIN_SIZE_OZ (concentrates by prepared volume), and
+       total_price within _bottle_price_cap (MAX_PRICE for regular bottles).
     2. Canned/pack: must match an allowed brand, be black coffee, have can count, and price_per_can < MAX_PRICE_PER_CAN.
     """
     if deal.price is None or deal.total_price is None:
@@ -956,13 +996,14 @@ def _filter(deal: Deal) -> bool:
             return price_per_can < MAX_PRICE_PER_CAN
         return False
 
-    # Bottled/jug check — must match a brand, be >= MIN_SIZE_OZ, and total_price < MAX_PRICE.
-    if deal.unit_oz is None or deal.unit_oz < MIN_SIZE_OZ:
+    # Bottled/jug check — prepared volume >= MIN_SIZE_OZ and price within the cap.
+    prepared = _prepared_oz(deal)
+    if prepared is None or prepared < MIN_SIZE_OZ:
         return False
     # Amazon search pages frequently omit shipping until the buyer selects a
     # delivery address. Keep the listed item price; the Discord message shows
     # shipping as N/A rather than treating the pod's location as authoritative.
-    if deal.total_price > MAX_PRICE:
+    if deal.total_price > _bottle_price_cap(deal):
         return False
     return True
 
@@ -971,13 +1012,13 @@ def _is_price_near_miss(deal: Deal) -> bool:
     """True for a brand-matched black bottle >= MIN_SIZE_OZ rejected only on price."""
     return (
         deal.total_price is not None
-        and deal.total_price > MAX_PRICE
+        and deal.total_price > _bottle_price_cap(deal)
         and not _is_canned(deal.title)
         and not _is_non_rtd(deal.title)
         and _matches_brand(deal.title)
         and _is_black_coffee(deal.title)
-        and deal.unit_oz is not None
-        and deal.unit_oz >= MIN_SIZE_OZ
+        and _prepared_oz(deal) is not None
+        and _prepared_oz(deal) >= MIN_SIZE_OZ
     )
 
 
@@ -994,6 +1035,14 @@ def _format_deal_block(d: Deal) -> str:
     """Format a single matching deal for a Discord message."""
     price_str = f"${d.total_price:.2f}" if d.total_price is not None else "?"
     unit_str = f"${d.unit_price:.3f}/oz" if d.unit_price is not None else "?/oz"
+    size_str = d.size or "?"
+
+    # Concentrates: show the diluted volume and price per prepared ounce.
+    prepared = _prepared_oz(d)
+    if _is_concentrate(d.title) and d.unit_oz is not None and prepared is not None:
+        size_str = f"{d.unit_oz:.0f} fl oz concentrate (makes ~{prepared:.0f} fl oz)"
+        if d.total_price is not None:
+            unit_str = f"${d.total_price / prepared:.3f}/oz prepared"
 
     # Add can-specific info if it's a canned deal
     can_info = ""
@@ -1005,7 +1054,7 @@ def _format_deal_block(d: Deal) -> str:
 
     return (
         f"**{d.title}**\n"
-        f"💰 Total: {price_str} ({unit_str}) | {d.size or '?'}{can_info}\n"
+        f"💰 Total: {price_str} ({unit_str}) | {size_str}{can_info}\n"
         f"📦 Source: {d.source} | Shipping: {d.shipping or 'N/A'}\n"
         f"🔗 {d.url}"
     )
@@ -1036,7 +1085,7 @@ def _send_discord(matches: List[Deal]) -> None:
 
     header = (
         f"☕ **DealFindr** found {len(matches)} cold-brew deal(s)!\n"
-        f"Bottled: {MIN_SIZE_OZ:.0f}oz+ at ${MAX_PRICE:.2f} or less | "
+        f"Bottled: {MIN_SIZE_OZ:.0f}oz+ at ${MAX_PRICE:.2f} or less (concentrates by prepared volume) | "
         f"Canned: under ${MAX_PRICE_PER_CAN:.2f}/can\n\n"
     )
     chunks: List[str] = []
@@ -1194,7 +1243,8 @@ def main() -> None:
                 continue
             if not _matches_brand(d.title):
                 continue
-            if d.unit_oz is None or d.unit_oz < MIN_SIZE_OZ:
+            prepared = _prepared_oz(d)
+            if prepared is None or prepared < MIN_SIZE_OZ:
                 continue
 
             try:
@@ -1219,13 +1269,21 @@ def main() -> None:
         # Log the cheapest bottles that failed only on price, so a quiet day
         # can be told apart from scrapers returning nothing relevant.
         near = sorted((d for d in unique if _is_price_near_miss(d)), key=lambda d: d.total_price)
-        _log(f"Near misses (bottled, over ${MAX_PRICE:.2f}): {len(near)}")
+        _log(f"Near misses (bottled, over price cap): {len(near)}")
         for d in near[:10]:
-            _log(f"  ${d.total_price:.2f} | {d.unit_oz:.0f} fl oz | {d.source} | {d.title[:70]}")
+            kind = " concentrate" if _is_concentrate(d.title) else ""
+            _log(
+                f"  ${d.total_price:.2f} (cap ${_bottle_price_cap(d):.2f}) | "
+                f"{d.unit_oz:.0f} fl oz{kind} | {d.source} | {d.title[:70]}"
+            )
 
         # Sort by unit price ascending (best deal first).
         # For canned deals without unit_oz, sort by price_per_can.
         def _sort_key(d: Deal) -> float:
+            if _is_concentrate(d.title):
+                prepared = _prepared_oz(d)
+                if prepared and d.total_price is not None:
+                    return d.total_price / prepared
             if d.unit_price is not None:
                 return d.unit_price
             can_count = _extract_can_count(d.title)

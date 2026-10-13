@@ -231,6 +231,63 @@ class TestDealfindrCronFilters:
         assert dealfindr_cron._extract_can_count(d.title) == 12
         assert dealfindr_cron._filter(d)  # 10.00 / 12 = $0.83/can < $1.00
 
+    _DUNKIN_CONC = "Dunkin’ Cold Brew Concentrated Coffee, 31 Fl Oz. Bottle"
+
+    def _dunkin(self, price: float) -> "dealfindr.Deal":
+        d = dealfindr.Deal(self._DUNKIN_CONC, price, "https://amazon.com/dp/x", "Amazon", shipping=0.0)
+        return dealfindr_cron._post_process(d)
+
+    def test_dunkin_concentrate_prepared_volume_and_cap(self):
+        d = self._dunkin(5.81)
+        assert d.unit_oz == 31.0
+        assert dealfindr_cron._prepared_oz(d) == 62.0
+        assert dealfindr_cron._bottle_price_cap(d) == 5.81
+        assert dealfindr_cron._filter(d)
+
+    @pytest.mark.parametrize("price", [5.82, 8.58])
+    def test_dunkin_concentrate_over_cap_is_near_miss(self, price):
+        d = self._dunkin(price)
+        assert not dealfindr_cron._filter(d)
+        assert dealfindr_cron._is_price_near_miss(d)
+
+    def test_dunkin_flavored_concentrate_rejected(self):
+        d = dealfindr.Deal(
+            "Dunkin’ Pumpkin Spice Artificially Flavored Cold Brew Concentrated Coffee, 31 Fl oz Bottle",
+            4.00,
+            "https://amazon.com/dp/y",
+            "Amazon",
+            shipping=0.0,
+        )
+        dealfindr_cron._post_process(d)
+        assert not dealfindr_cron._filter(d)
+
+    def test_dunkin_small_iced_coffee_rejected(self):
+        d = dealfindr.Deal(
+            "Dunkin' Original Iced Coffee, 13.7 Oz Bottle",
+            2.00,
+            "https://amazon.com/dp/z",
+            "Amazon",
+            shipping=0.0,
+        )
+        dealfindr_cron._post_process(d)
+        assert not dealfindr_cron._filter(d)
+
+    def test_regular_bottle_cap_unchanged(self):
+        d = dealfindr.Deal(
+            "Starbucks Cold Brew Black Unsweetened, 48 fl oz",
+            4.00,
+            "https://example.com",
+            "Walmart",
+            shipping=0.0,
+        )
+        d.unit_oz = 48.0
+        assert dealfindr_cron._bottle_price_cap(d) == 4.50
+
+    def test_concentrate_deal_block_shows_prepared_volume(self):
+        block = dealfindr_cron._format_deal_block(self._dunkin(5.81))
+        assert "concentrate (makes ~62 fl oz)" in block
+        assert "/oz prepared" in block
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Relevance filtering
