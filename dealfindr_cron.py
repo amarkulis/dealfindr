@@ -439,6 +439,41 @@ _PRODUCT_CLIP_RE = re.compile(
 )
 
 
+def _amazon_buybox_price(soup) -> Optional[float]:
+    """Return the product's own price from the buy box, or None.
+
+    Scoped to the buy-box price containers because carousels of other products
+    (and per-unit / list prices) also contain ".a-price" elements.
+    """
+    selectors = (
+        "#corePrice_feature_div .apex-pricetopay-value",
+        "#corePriceDisplay_desktop_feature_div .apex-pricetopay-value",
+        "#corePrice_feature_div .priceToPay",
+        "#corePriceDisplay_desktop_feature_div .priceToPay",
+    )
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el is None:
+            continue
+        price = None
+        off = el.select_one(".a-offscreen")
+        off_text = off.get_text(strip=True) if off else ""
+        if off_text:
+            price = _parse_price(off_text)
+        else:
+            whole = el.select_one(".a-price-whole")
+            frac = el.select_one(".a-price-fraction")
+            if whole:
+                # The whole part's text already ends with the decimal point.
+                price_str = whole.get_text(strip=True).replace(",", "").rstrip(".")
+                if frac:
+                    price_str += "." + frac.get_text(strip=True)
+                price = _parse_price(price_str)
+        if price is not None and price > 0:
+            return price
+    return None
+
+
 def _check_amazon_product_discount(deal: Deal) -> Optional[float]:
     """Check an Amazon product page for the real price and any discounts.
 
@@ -498,38 +533,18 @@ def _check_amazon_product_discount(deal: Deal) -> Optional[float]:
             _log(f"  [amazon] {asin}: product availability not verified; keeping listed price")
             return None
 
-        # The main price is the first ".a-price-whole" + ".a-price-fraction" pair
-        # (the default/selected variant). The whole part already contains the
-        # decimal point (e.g. "3."), so we strip it before appending the fraction.
-        # This avoids the ".a-offscreen" trap where per-ounce ("$0.08") and
-        # smaller-variant prices appear before the real 48oz price.
-        real_price = None
-        whole = soup.select_one(".a-price-whole")
-        frac = soup.select_one(".a-price-fraction")
-        if whole:
-            price_str = whole.get_text(strip=True).replace(",", "").rstrip(".")
-            if frac:
-                price_str += "." + frac.get_text(strip=True)
-            try:
-                real_price = float(price_str)
-            except ValueError:
-                real_price = None
+        # Out of stock: there is no buy-box price, and any ".a-price" left on the
+        # page belongs to a carousel of other products.
+        buybox = soup.select_one("#buybox")
+        if buybox and "out of stock" in buybox.get_text(" ", strip=True).lower():
+            _log(f"  [amazon] {asin}: out of stock on product page; keeping listed price")
+            return None
 
-        # Fallback: the clean ".priceToPay" element (e.g. "$3.99").
-        if not real_price:
-            price_to_pay = soup.select_one(".priceToPay")
-            if price_to_pay:
-                real_price = _parse_price(price_to_pay.get_text(strip=True))
-
-        if not real_price or real_price <= 0:
-            offscreen = soup.select_one(".a-offscreen")
-            _log(
-                "  [amazon] %s: no price parsed "
-                "(offscreen=%s)" % (
-                    asin,
-                    offscreen.get_text(strip=True) if offscreen else "none",
-                )
-            )
+        # The price must come from this product's own buy box, never from a
+        # page-wide ".a-price" (carousels, per-unit and list prices).
+        real_price = _amazon_buybox_price(soup)
+        if real_price is None:
+            _log(f"  [amazon] {asin}: no buy-box price; keeping listed price")
             return None
 
         # NOTE: We deliberately do NOT apply Subscribe & Save discounts. S&S is a
@@ -537,7 +552,12 @@ def _check_amazon_product_discount(deal: Deal) -> Optional[float]:
         # misleading — the real one-time price is the regular list price.
 
         # Check for clip coupon.
-        clip_m = _PRODUCT_CLIP_RE.search(resp.text)
+        # Search only this product's price/buy-box blocks: carousels of other
+        # products elsewhere on the page carry their own coupon badges.
+        own_html = "".join(str(el) for el in soup.select(
+            "#apex_desktop, #buybox, #promoPriceBlockMessage_feature_div, #couponsInBuybox_feature_div"
+        ))
+        clip_m = _PRODUCT_CLIP_RE.search(own_html)
         if clip_m:
             if clip_m.group(1):  # "You pay $X.XX with coupon"
                 return float(clip_m.group(1))

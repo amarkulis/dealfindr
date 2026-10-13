@@ -111,6 +111,60 @@ class TestAmazonProductPriceFallback:
         with patch.object(dealfindr_cron, "_amazon_get", return_value=None):
             assert dealfindr_cron._check_amazon_product_discount(d) is None
 
+    @staticmethod
+    def _deal():
+        return dealfindr.Deal(
+            "Bizzy Cold Brew Coffee, 48 fl oz", 4.99, "https://www.amazon.com/dp/B0FK8B3K76", "Amazon"
+        )
+
+    _CAROUSEL = (
+        '<div id="msContainer_feature_div_0"><span class="a-price"><span class="a-offscreen">$12.69</span>'
+        '<span aria-hidden="true"><span class="a-price-whole">12<span class="a-price-decimal">.</span></span>'
+        '<span class="a-price-fraction">69</span></span></span></div>'
+    )
+
+    def _run(self, html):
+        resp = MagicMock()
+        resp.text = html
+        with patch.object(dealfindr_cron, "_amazon_get", return_value=resp):
+            return dealfindr_cron._check_amazon_product_discount(self._deal())
+
+    def test_in_stock_uses_buybox_not_earlier_carousel(self):
+        html = (
+            "<html><body>" + self._CAROUSEL +
+            '<div id="buybox"><div id="corePrice_feature_div">'
+            '<span class="a-price apex-pricetopay-value"><span class="a-offscreen">$4.99</span></span>'
+            '<span class="a-price a-text-price apex-priceperunit-value"><span class="a-offscreen">$0.10</span></span>'
+            '</div></div><div id="availability">In Stock</div></body></html>'
+        )
+        assert self._run(html) == 4.99
+
+    def test_empty_offscreen_falls_back_to_whole_and_fraction(self):
+        html = (
+            '<html><body><div id="corePriceDisplay_desktop_feature_div">'
+            '<span class="a-price priceToPay apex-pricetopay-value"><span class="a-offscreen"></span>'
+            '<span aria-hidden="true"><span class="a-price-symbol">$</span>'
+            '<span class="a-price-whole">4<span class="a-price-decimal">.</span></span>'
+            '<span class="a-price-fraction">99</span></span></span>'
+            '<span class="a-price a-text-price apex-priceperunit-value"><span class="a-offscreen">$0.10</span></span>'
+            '<span class="a-price a-text-price apex-basisprice-value"><span class="a-offscreen">$17.00</span></span>'
+            '</div></body></html>'
+        )
+        assert self._run(html) == 4.99
+
+    def test_out_of_stock_returns_none(self):
+        html = (
+            '<html><body><div id="buybox">Out of Stock</div>'
+            '<div id="corePrice_desktop">Price: $4.99 (<span class="a-price a-text-price a-size-small">'
+            '<span class="a-offscreen">$0.10</span></span> / fluid ounce)</div>'
+            + self._CAROUSEL + '</body></html>'
+        )
+        assert self._run(html) is None
+
+    def test_no_buybox_price_returns_none(self):
+        html = '<html><body><div id="buybox">Something</div>' + self._CAROUSEL + '</body></html>'
+        assert self._run(html) is None
+
 
 class TestDealfindrCronFilters:
     def test_kcup_pods_rejected(self):
