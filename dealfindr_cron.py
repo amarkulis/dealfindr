@@ -854,11 +854,13 @@ def search_target_playwright(query: str, max_results: int = 20) -> List[Deal]:
     try:
         browser = _get_browser()
         page = browser.new_page()
-        # The page shell always loads; results come from the plp_search API,
+        # The page shell always loads; results come from Target's redsky APIs,
         # which PerimeterX answers with HTTP 4xx (435) when it flags the client.
+        # Once flagged, the page may not even request plp_search, so watch
+        # every redsky call.
         api_errors: List[int] = []
         page.on("response", lambda r: api_errors.append(r.status)
-                if "plp_search" in r.url and r.status >= 400 else None)
+                if "redsky.target.com" in r.url and r.status >= 400 else None)
         try:
             page.set_default_timeout(20000)
             page.goto(url, wait_until="domcontentloaded")
