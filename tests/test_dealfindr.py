@@ -1144,3 +1144,120 @@ class TestExportWithSize:
         assert data["deals"][0]["size"] == "2 lb (32 oz)"
         assert data["deals"][0]["unit_oz"] == 32.0
         assert data["deals"][0]["unit_price"] == pytest.approx(15.99 / 32.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Flipp / Brookhaven weekly ads (offline)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _mock_resp(payload, status=200):
+    m = MagicMock()
+    m.status_code = status
+    m.json.return_value = payload
+    return m
+
+
+class TestPerUnitPrice:
+    @pytest.mark.parametrize("price,pre,expected", [
+        (10, "2/", 5.0),
+        (6.00, "2/", 3.0),
+        (6, "2 FOR", 3.0),
+        (5.99, "sale price", 5.99),
+        (5.99, "*", 5.99),
+        (1.99, None, 1.99),
+    ])
+    def test_cases(self, price, pre, expected):
+        assert dealfindr_cron._per_unit_price(price, pre) == expected
+
+
+class TestSearchFlipp:
+    def _run(self):
+        target = {"id": 1, "name": "SToK 48-oz. cold brew coffee", "merchant_name": "Target",
+                  "current_price": 10, "pre_price_text": "2/", "flyer_id": 111}
+        hyvee = {"id": 2, "name": "Starbucks Iced Coffee", "merchant_name": "Hy-Vee",
+                 "current_price": 4.99, "pre_price_text": "", "flyer_id": 111}
+        other = {"id": 4, "name": "Chicken Breast", "merchant_name": "Meijer",
+                 "current_price": 2.99, "flyer_id": 111}
+        search = {"items": [target, hyvee, dict(target), other]}
+        requested = []
+
+        def fake_get(url, *args, **kwargs):
+            requested.append(url)
+            if "items/search" in url:
+                return _mock_resp(search)
+            if url.endswith("/items/1") or url.endswith("/items/2"):
+                return _mock_resp({"item": {"description": "48 oz. Select varieties."}})
+            return _mock_resp({}, 404)
+
+        with patch("dealfindr_cron.requests.get", side_effect=fake_get):
+            deals = dealfindr_cron.search_flipp(query="coffee")
+        return deals, requested
+
+    def test_multi_merchant_per_unit_price_and_dedup(self):
+        deals, requested = self._run()
+        sources = {d.source for d in deals}
+        assert {"Flipp (Target)", "Flipp (Hy-Vee)"} <= sources
+        target = [d for d in deals if d.source == "Flipp (Target)"]
+        assert len(target) == 1
+        assert target[0].price == 5.0
+        assert len(deals) == 3  # target, hyvee, non-brand (duplicate dropped)
+
+    def test_description_in_title_and_no_detail_for_non_brand(self):
+        deals, requested = self._run()
+        brand = [d for d in deals if d.source == "Flipp (Hy-Vee)"][0]
+        assert "48 oz. Select varieties." in brand.title
+        assert not any(u.endswith("/items/4") for u in requested)
+        assert sum(1 for u in requested if u.endswith("/items/1")) == 1
+
+
+class TestDedupFlyerItems:
+    def test_flipp_items_sharing_flyer_url_kept(self):
+        a = dealfindr.Deal("Stok Cold Brew", 5.0, "https://flipp.com/flyer/1", "Flipp (Target)")
+        b = dealfindr.Deal("Starbucks Iced Coffee", 4.0, "https://flipp.com/flyer/1", "Flipp (Target)")
+        assert len(dealfindr_cron._dedup([a, b])) == 2
+        assert len(dealfindr_cron._dedup([a, dealfindr.Deal(a.title, 5.0, a.url, a.source)])) == 1
+
+    def test_amazon_same_url_collapsed(self):
+        u = "https://www.amazon.com/dp/B000"
+        a = dealfindr.Deal("Cold Brew A", 5.0, u, "Amazon")
+        b = dealfindr.Deal("Cold Brew B", 5.0, u + "?tag=x", "Amazon")
+        assert len(dealfindr_cron._dedup([a, b])) == 1
+
+
+class TestSearchBrookhaven:
+    def test_parses_ad(self):
+        pubs = [{"id": 8190677, "name": "Weekly Ad", "valid_from": "2026-10-21", "valid_to": "2026-10-27"}]
+        products = [
+            {"name": "Stok Cold Brew Coffee", "description": "48 oz.", "price_text": "8.00",
+             "pre_price_text": "2/", "post_price_text": "EA.", "sale_story": ""},
+            {"name": "Ground Coffee", "description": "", "price_text": "5.99",
+             "pre_price_text": "", "post_price_text": "LB."},
+        ]
+
+        def fake_get(url, *args, **kwargs):
+            if "/publications/brookhavenmarkets" in url:
+                return _mock_resp(pubs)
+            if "/publication/8190677/products" in url:
+                return _mock_resp(products)
+            return _mock_resp({}, 404)
+
+        with patch("dealfindr_cron.requests.get", side_effect=fake_get):
+            deals = dealfindr_cron.search_brookhaven()
+        assert len(deals) == 1
+        d = deals[0]
+        assert d.price == 4.0
+        assert d.source == "Brookhaven Market"
+        assert d.url == "https://brookhavenmarket.com/weekly-ad/"
+        dealfindr_cron._post_process(d)
+        assert d.unit_oz == 48.0
+
+
+class TestPostProcessFlippSizes:
+    def test_hyphenated_oz(self):
+        d = dealfindr.Deal("SToK 48-oz. cold brew coffee", 5.0, "u", "Flipp (Target)")
+        assert dealfindr_cron._post_process(d).unit_oz == 48.0
+
+    def test_description_beats_inferred(self):
+        d = dealfindr.Deal("Starbucks Iced Coffee (40 oz)", 4.0, "u", "Flipp (Tony's Fresh Market)")
+        assert dealfindr_cron._post_process(d).unit_oz == 40.0

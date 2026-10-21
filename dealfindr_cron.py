@@ -15,7 +15,8 @@ Environment variables (see k8s/configmap.yaml + secret.yaml):
                           (default: 4.50 — $4.99 is regular shelf price for
                           48oz, not a deal)
   DEALFINDR_MAX_RESULTS   Max results per source        (default: 40)
-  DEALFINDR_AMAZON_ZIP    Amazon delivery ZIP           (default: 60480)
+  DEALFINDR_ZIP           Home ZIP for Amazon delivery + Flipp weekly ads
+                          (default: 60480; old name DEALFINDR_AMAZON_ZIP still works)
   DISCORD_WEBHOOK_URL     Discord webhook for the dealfindr channel (secret)
 """
 
@@ -55,8 +56,8 @@ from dealfindr import (
 # Flipp weekly ad scraper (for local grocery stores)
 # --------------------------------------------------------------------------- #
 
-# Tony's Fresh Market (Countryside, IL) and Brookhaven Markets (Burr Ridge)
-# are on Flipp. The search API returns flyer items with prices.
+# Local grocery weekly ads are on Flipp. The search API returns flyer items
+# (from every merchant near HOME_ZIP) with prices.
 _FLIPP_SEARCH_URL = "https://backflipp.wishabi.com/flipp/items/search"
 _FLIPP_FLYER_URL = "https://flipp.com/flyer/{flyer_id}"
 _FLIPP_HEADERS = {
@@ -64,13 +65,6 @@ _FLIPP_HEADERS = {
     "Accept": "application/json",
     "Origin": "https://flipp.com",
     "Referer": "https://flipp.com/",
-}
-
-# Local grocery stores to track on Flipp.
-_FLIPP_STORES = {
-    "Tony's Fresh Market": 8070327,
-    "Jewel-Osco": 8080940,
-    # Brookhaven Markets (flyer_id=8073332) has no searchable items on Flipp.
 }
 
 # Flipp search queries — brand-specific queries return more results than
@@ -86,17 +80,45 @@ _FLIPP_QUERIES = [
 ]
 
 
-def search_flipp(query: str = "", postal_code: str = "60108", max_results: int = 40) -> List[Deal]:
-    """Search Flipp weekly ads for cold brew deals at local grocery stores.
+_FLIPP_ITEM_URL = "https://backflipp.wishabi.com/flipp/items/{item_id}"
+
+# Multi-buy prefixes ("2/", "3 FOR") mean the listed price is a total for n units.
+_MULTIBUY_RE = re.compile(r"^\s*(\d+)\s*(?:/|for)\s*$", re.IGNORECASE)
+
+
+def _per_unit_price(price: float, pre_price_text: Optional[str]) -> float:
+    """Convert a multi-buy total ("2/" $10, "2 FOR" $6) to a per-unit price."""
+    m = _MULTIBUY_RE.match(pre_price_text or "")
+    if m and int(m.group(1)) > 0:
+        return round(price / int(m.group(1)), 2)
+    return price
+
+
+def _flipp_description(item_id) -> str:
+    """Fetch an item's description (usually the size) from Flipp; "" on any error."""
+    try:
+        r = requests.get(_FLIPP_ITEM_URL.format(item_id=item_id), headers=_FLIPP_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return ""
+        return ((r.json().get("item") or {}).get("description") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def search_flipp(query: str = "", postal_code: Optional[str] = None, max_results: int = 200) -> List[Deal]:
+    """Search Flipp weekly ads for cold brew deals at grocery stores near HOME_ZIP.
 
     Uses broad brand-specific queries instead of a single generic query since
     Flipp's API returns very few results for "cold brew coffee" (0-5 items)
-    but many more for brand names like "Starbucks" (10+ items including Tony's).
+    but many more for brand names like "Starbucks".
 
-    The Flipp API ignores merchant_id/flyer_id filters, so we search broadly
-    and filter client-side by merchant_name.
+    Items from every merchant are kept; brand/size/price filtering happens
+    later. Multi-buy prices ("2/" $10) are converted to per-unit, and for brand
+    items the detail endpoint supplies a description (usually the size).
     """
+    postal_code = postal_code or HOME_ZIP
     deals: List[Deal] = []
+    seen_ids = set()
     queries_to_try = _FLIPP_QUERIES if not query else [query]
 
     for q in queries_to_try:
@@ -116,14 +138,19 @@ def search_flipp(query: str = "", postal_code: str = "60108", max_results: int =
             continue
 
         items = data.get("items", [])
-        store_names = set(_FLIPP_STORES.keys())
 
         for item in items:
             if len(deals) >= max_results:
                 break
 
+            item_id = item.get("id")
+            if item_id is not None:
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+
             merchant = (item.get("merchant_name") or "").strip()
-            if merchant not in store_names:
+            if not merchant:
                 continue
 
             name = (item.get("name") or "").strip()
@@ -133,22 +160,109 @@ def search_flipp(query: str = "", postal_code: str = "60108", max_results: int =
             price = item.get("current_price")
             if price is None or price <= 0:
                 continue
+            price = _per_unit_price(float(price), item.get("pre_price_text"))
 
             # Build the flyer URL.
             flyer_id = item.get("flyer_id")
             url = _FLIPP_FLYER_URL.format(flyer_id=flyer_id) if flyer_id else "https://flipp.com"
 
+            # Brand items: the size usually lives only in the detail description.
+            title = name
+            if item_id is not None and _matches_brand(name):
+                description = _flipp_description(item_id)
+                if description:
+                    title = f"{name} ({description})"
+
             # Include sale story in title for context (e.g., "BUY 3 SAVE $3").
             sale_story = (item.get("sale_story") or "").strip()
             post_price = (item.get("post_price_text") or "").strip()
-            title = name
             if sale_story:
-                title = f"{name} [{sale_story}]"
+                title = f"{title} [{sale_story}]"
             if post_price:
                 title = f"{title} {post_price}"
 
             source = f"Flipp ({merchant})"
-            deals.append(Deal(title[:120], float(price), url, source, "New", shipping=0.0))
+            deals.append(Deal(title[:120], price, url, source, "New", shipping=0.0))
+
+    return deals
+
+
+# Brookhaven Market (Burr Ridge, IL) isn't in Flipp search; its weekly ad is a
+# Flipp storefront widget with a public token (see brookhavenmarket.com/weekly-ad/).
+_BROOKHAVEN_BASE = "https://dam.flippenterprise.net/flyerkit"
+_BROOKHAVEN_TOKEN = "ee2aeb84eddded391cff70123c419795"
+_BROOKHAVEN_MERCHANT = "brookhavenmarkets"
+# Brookhaven's store_code is the store address; this is the Burr Ridge store.
+_BROOKHAVEN_STORE_CODE = "100 Burr Ridge Parkway"
+_BROOKHAVEN_AD_URL = "https://brookhavenmarket.com/weekly-ad/"
+
+
+def search_brookhaven() -> List[Deal]:
+    """Read Brookhaven Market's weekly ad (Burr Ridge store) via its Flipp widget."""
+    deals: List[Deal] = []
+    try:
+        r = requests.get(
+            f"{_BROOKHAVEN_BASE}/publications/{_BROOKHAVEN_MERCHANT}",
+            params={
+                "locale": "en-US",
+                "access_token": _BROOKHAVEN_TOKEN,
+                "store_code": _BROOKHAVEN_STORE_CODE,
+            },
+            headers=_FLIPP_HEADERS,
+            timeout=15,
+        )
+        if r.status_code != 200:
+            _log(f"  search_brookhaven publications HTTP {r.status_code}")
+            return deals
+        publications = r.json()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  search_brookhaven publications error: {exc}")
+        return deals
+
+    for pub in publications or []:
+        pub_id = pub.get("id")
+        if pub_id is None:
+            continue
+        try:
+            r = requests.get(
+                f"{_BROOKHAVEN_BASE}/publication/{pub_id}/products",
+                params={
+                    "display_type": "all",
+                    "locale": "en-US",
+                    "access_token": _BROOKHAVEN_TOKEN,
+                },
+                headers=_FLIPP_HEADERS,
+                timeout=15,
+            )
+            if r.status_code != 200:
+                _log(f"  search_brookhaven({pub_id}) HTTP {r.status_code}")
+                continue
+            products = r.json()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  search_brookhaven({pub_id}) error: {exc}")
+            continue
+
+        for p in products or []:
+            name = (p.get("name") or "").strip()
+            if not name:
+                continue
+            price = _parse_price(str(p.get("price_text") or ""))
+            if price is None or price <= 0:
+                continue
+            # Per-pound prices aren't comparable to bottle prices.
+            if "lb" in (p.get("post_price_text") or "").lower():
+                continue
+            price = _per_unit_price(price, p.get("pre_price_text"))
+
+            title = name
+            description = (p.get("description") or "").strip()
+            if description:
+                title = f"{title} ({description})"
+            sale_story = (p.get("sale_story") or "").strip()
+            if sale_story:
+                title = f"{title} [{sale_story}]"
+
+            deals.append(Deal(title[:120], price, _BROOKHAVEN_AD_URL, "Brookhaven Market", "New", shipping=0.0))
 
     return deals
 
@@ -639,8 +753,10 @@ try:
 except ValueError:
     MAX_RESULTS = 40
 
-# Amazon delivery ZIP (Willow Springs, IL). Empty disables location setup.
-AMAZON_ZIP = os.getenv("DEALFINDR_AMAZON_ZIP", "60480").strip()
+# Home ZIP (Willow Springs, IL): used for Amazon delivery location and Flipp
+# weekly ads. DEALFINDR_AMAZON_ZIP is the old name. Empty disables Amazon
+# location setup.
+HOME_ZIP = (os.getenv("DEALFINDR_ZIP") or os.getenv("DEALFINDR_AMAZON_ZIP") or "60480").strip()
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -927,6 +1043,9 @@ def _bottle_price_cap(deal: Deal) -> float:
 _FL_OZ_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(?:fl\.?\s*oz|fluid\s*ounces?|fz)\b', re.IGNORECASE)
 
 
+_HYPHEN_OZ_RE = re.compile(r'(\d+(?:\.\d+)?)\s*-\s*oz\b', re.IGNORECASE)
+
+
 def _extract_fl_oz(title: str) -> Optional[float]:
     """Extract fluid ounces from a title (handles 'fl oz', 'Fluid Ounces')."""
     m = _FL_OZ_RE.search(title)
@@ -944,6 +1063,11 @@ def _post_process(deal: Deal) -> Deal:
         deal.unit_oz = _extract_fl_oz(deal.title)
     if deal.unit_oz is None:
         deal.unit_oz = _title_to_oz(deal.title)
+    # Hyphenated sizes ("48-oz.") that the shared regexes miss.
+    if deal.unit_oz is None:
+        m = _HYPHEN_OZ_RE.search(deal.title)
+        if m:
+            deal.unit_oz = float(m.group(1))
     # Flipp fallback: some Flipp items don't include size in the name.
     # Infer from known products (e.g., Stōk cold brew = 48oz standard).
     if deal.unit_oz is None and "Flipp" in (deal.source or ""):
@@ -1160,13 +1284,15 @@ def _search_all() -> tuple:
 
     all_deals: List[Deal] = []
 
-    # Phase 1: Walmart + Flipp in parallel (thread-safe, no rate-limit issues).
+    # Phase 1: Walmart + Flipp + Brookhaven in parallel (thread-safe, no rate-limit issues).
     req_tasks: List[tuple] = []
     for q in queries:
         req_tasks.append((f"search_walmart({q!r})", lambda q=q: search_walmart(q, MAX_RESULTS)))
     # Flipp runs once with its own brand-name query list (_FLIPP_QUERIES);
     # passing our "X cold brew" queries returns nothing from Flipp's API.
     req_tasks.append(("search_flipp(brands)", lambda: search_flipp()))
+    # Brookhaven Market's weekly ad (not in Flipp search) via its storefront widget.
+    req_tasks.append(("search_brookhaven()", search_brookhaven))
 
     with ThreadPoolExecutor(max_workers=min(len(req_tasks), 8)) as pool:
         futures = {pool.submit(fn): label for label, fn in req_tasks}
@@ -1180,7 +1306,7 @@ def _search_all() -> tuple:
                 _log(f"  {label} FAILED: {exc}")
 
     # Phase 2: Amazon sequentially with delays + coupon extraction.
-    _set_amazon_location(AMAZON_ZIP)
+    _set_amazon_location(HOME_ZIP)
     all_coupons: dict = {}
     for i, q in enumerate(queries):
         if i > 0:
@@ -1208,11 +1334,17 @@ def _search_all() -> tuple:
 
 
 def _dedup(deals: List[Deal]) -> List[Deal]:
-    """De-duplicate deals by normalized URL (Amazon + Walmart may overlap on queries)."""
+    """De-duplicate deals by normalized URL (Amazon + Walmart may overlap on queries).
+
+    Flipp/Brookhaven items share a flyer URL, so those also key on title.
+    """
     seen = set()
     unique: List[Deal] = []
     for d in deals:
         key = _normalize_url(d.url) if d.url else d.title.lower()
+        # Flyer items share their flyer's URL, so include the title in the key.
+        if d.url and (d.source or "").startswith(("Flipp", "Brookhaven")):
+            key = f"{key}|{d.title.lower()}"
         if key in seen:
             continue
         seen.add(key)
