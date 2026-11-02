@@ -1261,3 +1261,82 @@ class TestPostProcessFlippSizes:
     def test_description_beats_inferred(self):
         d = dealfindr.Deal("Starbucks Iced Coffee (40 oz)", 4.0, "u", "Flipp (Tony's Fresh Market)")
         assert dealfindr_cron._post_process(d).unit_oz == 40.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Multi-pack bottles, Sam's Club, nog/horchata
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SAMS_STARBUCKS = "Starbucks Cold Brew Coffee Concentrates, Signature Black, 32 oz., 2 ct."
+_CALIFIA_6PK = "Califia Farms Pure Black Cold Brew Coffee, 48 Oz (Pack of 6)"
+
+
+def _cron_deal(title, price, source):
+    return dealfindr_cron._post_process(dealfindr.Deal(title, price, "http://x", source, "New"))
+
+
+class TestPackCount:
+    @pytest.mark.parametrize("title,expected", [
+        (_SAMS_STARBUCKS, 2),
+        (_CALIFIA_6PK, 6),
+        ("Bizzy Cold Brew 2 x 48 fl oz", 2),
+        ("Bizzy Organic Unsweetened Espresso Blend Cold Brew Coffee, 2x More Caffeine, 48 fl oz", 1),
+        ("La Colombe Medium Roast Cold Brew Coffee, 48 FZ", 1),
+        ("Starbucks Cold Brew 6-pack 48 fl oz", 6),
+        ("Bizzy Cold Brew 6 × 48 oz", 6),
+    ])
+    def test_extract(self, title, expected):
+        assert dealfindr_cron._extract_pack_count(title) == expected
+
+    def test_sams_concentrate_pack(self):
+        assert dealfindr_cron._filter(_cron_deal(_SAMS_STARBUCKS, 13.98, "Sam's Club")) is False
+        assert dealfindr_cron._is_price_near_miss(_cron_deal(_SAMS_STARBUCKS, 13.98, "Sam's Club"))
+        assert dealfindr_cron._filter(_cron_deal(_SAMS_STARBUCKS, 11.98, "Sam's Club")) is True
+
+    def test_amazon_pack_of_six(self):
+        assert dealfindr_cron._filter(_cron_deal(_CALIFIA_6PK, 25.00, "Amazon")) is True
+        bad = _cron_deal(_CALIFIA_6PK, 30.00, "Amazon")
+        assert dealfindr_cron._filter(bad) is False
+        assert dealfindr_cron._is_price_near_miss(bad)
+
+    def test_weekly_ad_text_not_a_pack(self):
+        d = _cron_deal("Dannon Greek Yogurt 4 pk., Starbucks Cold Brew 48 oz.", 4.99, "Flipp (Jewel-Osco)")
+        assert dealfindr_cron._pack_count(d) == 1
+        assert dealfindr_cron._filter(d) is False
+
+    def test_nog_horchata_not_black(self):
+        assert dealfindr_cron._is_black_coffee("Califia Nog and Horchata (48 oz.)") is False
+
+    def test_format_block_pack(self):
+        block = dealfindr_cron._format_deal_block(_cron_deal(_SAMS_STARBUCKS, 11.98, "Sam's Club"))
+        assert "2 × 32 fl oz" in block
+        assert "$5.99/bottle" in block
+
+
+def _sams_html(products):
+    return ('<html><script id="__NEXT_DATA__" type="application/json">'
+            + json.dumps({"props": {"items": products}}) + "</script></html>")
+
+
+def _sams_product(name, item_id, price, path):
+    return {"name": name, "usItemId": item_id, "canonicalUrl": path + "?classType=REGULAR",
+            "priceInfo": {"linePrice": price}}
+
+
+class TestSamsClub:
+    def test_parses_and_dedups(self):
+        a = _sams_product(_SAMS_STARBUCKS, "1", "$13.98", "/ip/Starbucks-Cold-Brew/1")
+        b = _sams_product("La Colombe Cold Brew Cans 12 pk.", "2", "$14.98", "/ip/La-Colombe/2")
+        html = _sams_html([a, b, dict(a)])
+        with patch.object(dealfindr_cron, "_samsclub_get", return_value=html), \
+             patch.object(dealfindr_cron.time, "sleep"):
+            deals = dealfindr_cron.search_samsclub(["cold brew"])
+        assert [d.price for d in deals] == [13.98, 14.98]
+        assert deals[0].url == "https://www.samsclub.com/ip/Starbucks-Cold-Brew/1"
+        assert all(d.source == "Sam's Club" for d in deals)
+
+    def test_stops_when_blocked(self):
+        with patch.object(dealfindr_cron, "_samsclub_get", return_value=None) as g, \
+             patch.object(dealfindr_cron.time, "sleep"):
+            assert dealfindr_cron.search_samsclub(["a", "b"]) == []
+        assert g.call_count == 1

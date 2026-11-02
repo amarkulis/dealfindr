@@ -3,7 +3,8 @@
 dealfindr_cron.py — Cron entry point for daily cold-brew coffee deal alerts.
 
 Runs as a Kubernetes CronJob on the TC cluster. Searches Amazon, Walmart,
-Target, and local grocery weekly ads (Flipp) for cold-brew coffee, filters by
+Target, Sam's Club, and local grocery weekly ads (Flipp + Brookhaven) for
+cold-brew coffee, filters by
 brand / size / price, and posts any matches to a Discord webhook.
 
 Environment variables (see k8s/configmap.yaml + secret.yaml):
@@ -30,7 +31,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import requests
 from playwright.sync_api import sync_playwright, Browser
@@ -415,6 +416,84 @@ def _get_amazon_session():
     if _amazon_session is None:
         _amazon_session = cffi_requests.Session(impersonate="chrome")
     return _amazon_session
+
+
+# --------------------------------------------------------------------------- #
+# Sam's Club
+# --------------------------------------------------------------------------- #
+
+_samsclub_session = None
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
+)
+
+
+def _samsclub_get(url: str) -> Optional[str]:
+    """GET a Sam's Club page with a Chrome TLS fingerprint; text unless HTTP 200."""
+    global _samsclub_session
+    if cffi_requests is None:
+        return None
+    try:
+        if _samsclub_session is None:
+            _samsclub_session = cffi_requests.Session(impersonate="chrome")
+        resp = _samsclub_session.get(url, timeout=20)
+    except Exception as exc:
+        _log(f"  [samsclub] GET failed: {exc}")
+        return None
+    if resp.status_code != 200:
+        _log(f"  [samsclub] HTTP {resp.status_code}")
+        return None
+    return resp.text
+
+
+def _walk_samsclub_products(node, found: list) -> None:
+    """Collect product dicts (a string name plus a priceInfo dict) from the page JSON."""
+    if isinstance(node, dict):
+        if isinstance(node.get("name"), str) and isinstance(node.get("priceInfo"), dict):
+            found.append(node)
+        for v in node.values():
+            _walk_samsclub_products(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_samsclub_products(v, found)
+
+
+def search_samsclub(queries: List[str], max_results: int = 40) -> List[Deal]:
+    """Search Sam's Club for each query in turn (2s apart) via the search page's __NEXT_DATA__."""
+    deals: List[Deal] = []
+    seen = set()
+    for i, query in enumerate(queries):
+        if i > 0:
+            time.sleep(2)
+        html = _samsclub_get(f"https://www.samsclub.com/s/{quote(query)}")
+        m = _NEXT_DATA_RE.search(html) if html else None
+        data = None
+        if m:
+            try:
+                data = json.loads(m.group(1))
+            except ValueError:
+                data = None
+        if data is None:
+            _log(f"  [samsclub] no data for {query}; skipping remaining Sam's Club searches")
+            break
+        products: list = []
+        _walk_samsclub_products(data, products)
+        count = 0
+        for p in products:
+            if count >= max_results:
+                break
+            key = p.get("usItemId") or p["name"]
+            if key in seen:
+                continue
+            price = _parse_price(str(p["priceInfo"].get("linePrice") or ""))
+            if price is None or price <= 0:
+                continue
+            seen.add(key)
+            path = (p.get("canonicalUrl") or "").split("?")[0]
+            deals.append(Deal(p["name"][:120], price, "https://www.samsclub.com" + path,
+                              "Sam's Club", "New", shipping=None))
+            count += 1
+    return deals
 
 
 # Runs on amazon.com: fetch a CSRF token via the "Deliver to" popup's data
@@ -992,6 +1071,7 @@ _BLACK_COFFEE_BLACKLIST = [
     "protein", "cream", "creamer", "frappuccino", "macchiato",
     "cappuccino", "cortado", "flat white",
     "pumpkin", "flavored",
+    "nog", "eggnog", "horchata",
 ]
 
 
@@ -1009,7 +1089,7 @@ def _is_black_coffee(title: str) -> bool:
 # twice its volume.
 CONCENTRATE_DILUTION = 2.0
 
-_CONCENTRATE_RE = re.compile(r'\bconcentrated?\b', re.IGNORECASE)
+_CONCENTRATE_RE = re.compile(r'\bconcentrat(?:e[ds]?|es)\b', re.IGNORECASE)
 
 
 def _is_concentrate(title: str) -> bool:
@@ -1039,6 +1119,42 @@ def _bottle_price_cap(deal: Deal) -> float:
     if prepared is None:
         return MAX_PRICE
     return round(MAX_PRICE * prepared / MIN_SIZE_OZ, 2)
+
+
+# Multi-pack bottles: "(Pack of 6)", "2 ct.", "6-pack", "2 x 48 fl oz", "3 bottles".
+# "2x More Caffeine" has no size after the x, so it never matches.
+_PACK_COUNT_RES = [
+    re.compile(r'\bpack\s+of\s+(\d+)\b', re.IGNORECASE),
+    re.compile(r'\b(\d+)\s*(?:pk\b\.?|-?\s*pack\b|ct\b\.?|count\b)', re.IGNORECASE),
+    re.compile(r'\b(\d+)\s*[x×]\s*\d+(?:\.\d+)?\s*(?:fl\.?\s*oz|oz|fz)\b', re.IGNORECASE),
+    re.compile(r'\b(\d+)\s*bottles\b', re.IGNORECASE),
+]
+
+
+def _extract_pack_count(title: str) -> int:
+    """Number of bottles in a listing (1 for a single bottle)."""
+    for pattern in _PACK_COUNT_RES:
+        m = pattern.search(title)
+        if m and 2 <= int(m.group(1)) <= 48:
+            return int(m.group(1))
+    return 1
+
+
+def _pack_count(deal: Deal) -> int:
+    """Bottles in the deal. Weekly-ad titles are combined text for several
+    products ("Dannon Greek Yogurt 4 pk., Stok Cold Brew 48 oz."), so their
+    pack sizes say nothing about the coffee."""
+    source = deal.source or ""
+    if source.startswith("Flipp") or source.startswith("Brookhaven"):
+        return 1
+    return _extract_pack_count(deal.title)
+
+
+def _per_bottle_price(deal: Deal) -> Optional[float]:
+    """Total price divided by the bottles in the pack."""
+    if deal.total_price is None:
+        return None
+    return deal.total_price / _pack_count(deal)
 
 
 # Regex for fluid ounce patterns that _WEIGHT_RE misses.
@@ -1149,7 +1265,7 @@ def _filter(deal: Deal) -> bool:
     # Amazon search pages frequently omit shipping until the buyer selects a
     # delivery address. Keep the listed item price; the Discord message shows
     # shipping as N/A rather than treating the pod's location as authoritative.
-    if deal.total_price > _bottle_price_cap(deal):
+    if _per_bottle_price(deal) > _bottle_price_cap(deal):
         return False
     return True
 
@@ -1158,7 +1274,7 @@ def _is_price_near_miss(deal: Deal) -> bool:
     """True for a brand-matched black bottle >= MIN_SIZE_OZ rejected only on price."""
     return (
         deal.total_price is not None
-        and deal.total_price > _bottle_price_cap(deal)
+        and _per_bottle_price(deal) > _bottle_price_cap(deal)
         and not _is_canned(deal.title)
         and not _is_non_rtd(deal.title)
         and _matches_brand(deal.title)
@@ -1190,6 +1306,19 @@ def _format_deal_block(d: Deal) -> str:
         if d.total_price is not None:
             unit_str = f"${d.total_price / prepared:.3f}/oz prepared"
 
+    # Multi-packs: size as "N × size", per-bottle price, per-ounce over the whole pack.
+    pack = 1 if _is_canned(d.title) else _pack_count(d)
+    pack_info = ""
+    if pack > 1 and d.unit_oz is not None and prepared is not None:
+        if _is_concentrate(d.title):
+            size_str = f"{pack} × {d.unit_oz:.0f} fl oz concentrate (makes ~{prepared:.0f} fl oz)"
+        else:
+            size_str = f"{pack} × {d.unit_oz:.0f} fl oz"
+        if d.total_price is not None:
+            suffix = " prepared" if _is_concentrate(d.title) else ""
+            unit_str = f"${d.total_price / (prepared * pack):.3f}/oz{suffix}"
+            pack_info = f" | ${d.total_price / pack:.2f}/bottle"
+
     # Add can-specific info if it's a canned deal
     can_info = ""
     if _is_canned(d.title):
@@ -1200,7 +1329,7 @@ def _format_deal_block(d: Deal) -> str:
 
     return (
         f"**{d.title}**\n"
-        f"💰 Total: {price_str} ({unit_str}) | {size_str}{can_info}\n"
+        f"💰 Total: {price_str}{pack_info} ({unit_str}) | {size_str}{can_info}\n"
         f"📦 Source: {d.source} | Shipping: {d.shipping or 'N/A'}\n"
         f"🔗 {d.url}"
     )
@@ -1286,7 +1415,8 @@ def _search_all() -> tuple:
 
     all_deals: List[Deal] = []
 
-    # Phase 1: Walmart + Flipp + Brookhaven in parallel (thread-safe, no rate-limit issues).
+    # Phase 1: Walmart + Flipp + Brookhaven + Sam's Club in parallel (thread-safe, no rate-limit
+    # issues; Sam's Club is a single task that walks its queries one at a time).
     req_tasks: List[tuple] = []
     for q in queries:
         req_tasks.append((f"search_walmart({q!r})", lambda q=q: search_walmart(q, MAX_RESULTS)))
@@ -1295,6 +1425,8 @@ def _search_all() -> tuple:
     req_tasks.append(("search_flipp(brands)", lambda: search_flipp()))
     # Brookhaven Market's weekly ad (not in Flipp search) via its storefront widget.
     req_tasks.append(("search_brookhaven()", search_brookhaven))
+    # Sam's Club: one task searching every query sequentially, so it never sees parallel requests.
+    req_tasks.append(("search_samsclub(queries)", lambda: search_samsclub(queries, MAX_RESULTS)))
 
     with ThreadPoolExecutor(max_workers=min(len(req_tasks), 8)) as pool:
         futures = {pool.submit(fn): label for label, fn in req_tasks}
@@ -1426,18 +1558,27 @@ def main() -> None:
         _log(f"Near misses (bottled, over price cap): {len(near)}")
         for d in near[:10]:
             kind = " concentrate" if _is_concentrate(d.title) else ""
+            pack = _pack_count(d)
+            if pack > 1:
+                price_part = (
+                    f"${d.total_price:.2f} for {pack} (${_per_bottle_price(d):.2f} ea, "
+                    f"cap ${_bottle_price_cap(d):.2f})"
+                )
+            else:
+                price_part = f"${d.total_price:.2f} (cap ${_bottle_price_cap(d):.2f})"
             _log(
-                f"  ${d.total_price:.2f} (cap ${_bottle_price_cap(d):.2f}) | "
+                f"  {price_part} | "
                 f"{d.unit_oz:.0f} fl oz{kind} | {d.source} | {d.title[:70]}"
             )
 
         # Sort by unit price ascending (best deal first).
         # For canned deals without unit_oz, sort by price_per_can.
         def _sort_key(d: Deal) -> float:
-            if _is_concentrate(d.title):
-                prepared = _prepared_oz(d)
-                if prepared and d.total_price is not None:
-                    return d.total_price / prepared
+            prepared = _prepared_oz(d)
+            if prepared and d.total_price is not None and (
+                _is_concentrate(d.title) or _pack_count(d) > 1
+            ):
+                return d.total_price / (prepared * _pack_count(d))
             if d.unit_price is not None:
                 return d.unit_price
             can_count = _extract_can_count(d.title)
