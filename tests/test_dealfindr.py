@@ -88,6 +88,23 @@ class TestDeal:
         assert d.condition == "Unknown"
 
 
+class TestWalmartBlock:
+    def test_stops_after_block(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(dealfindr_cron, "search_walmart", lambda q, n: calls.append(q) or [])
+        monkeypatch.setattr(dealfindr_cron, "_walmart_blocked", lambda: True)
+        monkeypatch.setattr(dealfindr_cron.time, "sleep", lambda s: None)
+        assert dealfindr_cron.search_walmart_all(["a", "b", "c"]) == []
+        assert calls == ["a"]
+
+    def test_empty_result_without_block_continues(self, monkeypatch):
+        d = dealfindr.Deal("Califia Cold Brew 48 fl oz", 5.48, "https://walmart.com/ip/1", "Walmart")
+        monkeypatch.setattr(dealfindr_cron, "search_walmart", lambda q, n: [d] if q == "b" else [])
+        monkeypatch.setattr(dealfindr_cron, "_walmart_blocked", lambda: False)
+        monkeypatch.setattr(dealfindr_cron.time, "sleep", lambda s: None)
+        assert dealfindr_cron.search_walmart_all(["a", "b"]) == [d]
+
+
 class TestAmazonCouponOrdering:
     def test_search_card_coupon_survives_product_page_check(self, monkeypatch):
         d = dealfindr.Deal(

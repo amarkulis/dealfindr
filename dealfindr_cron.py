@@ -458,6 +458,40 @@ def _walk_samsclub_products(node, found: list) -> None:
             _walk_samsclub_products(v, found)
 
 
+def _walmart_blocked() -> bool:
+    """True if Walmart answers with its "Robot or human?" bot challenge.
+
+    Walmart's bot protection redirects flagged clients to /blocked, which
+    search_walmart can't tell apart from a search with no results.
+    """
+    try:
+        r = requests.get(
+            "https://www.walmart.com/search?q=cold+brew",
+            headers=_headers("https://www.walmart.com/"),
+            timeout=16,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        return False
+    return "/blocked" in r.headers.get("location", "") or "robot or human" in r.text.lower()
+
+
+def search_walmart_all(queries: List[str]) -> List[Deal]:
+    """Search Walmart for each query in turn (2s apart); stop once it blocks us."""
+    deals: List[Deal] = []
+    for i, query in enumerate(queries):
+        if i > 0:
+            time.sleep(2)
+        results = search_walmart(query, MAX_RESULTS)
+        _log(f"  search_walmart({query!r}) -> {len(results)} raw deal(s)")
+        if not results and _walmart_blocked():
+            _log('  [walmart] BLOCKED by bot protection ("Robot or human?"); '
+                 "skipping remaining Walmart searches")
+            break
+        deals.extend(results)
+    return deals
+
+
 def search_samsclub(queries: List[str], max_results: int = 40) -> List[Deal]:
     """Search Sam's Club for each query in turn (2s apart) via the search page's __NEXT_DATA__."""
     deals: List[Deal] = []
@@ -1415,11 +1449,10 @@ def _search_all() -> tuple:
 
     all_deals: List[Deal] = []
 
-    # Phase 1: Walmart + Flipp + Brookhaven + Sam's Club in parallel (thread-safe, no rate-limit
-    # issues; Sam's Club is a single task that walks its queries one at a time).
+    # Phase 1: Walmart + Flipp + Brookhaven + Sam's Club in parallel (thread-safe; Walmart
+    # and Sam's Club are single tasks that walk their queries one at a time).
     req_tasks: List[tuple] = []
-    for q in queries:
-        req_tasks.append((f"search_walmart({q!r})", lambda q=q: search_walmart(q, MAX_RESULTS)))
+    req_tasks.append(("search_walmart_all(queries)", lambda: search_walmart_all(queries)))
     # Flipp runs once with its own brand-name query list (_FLIPP_QUERIES);
     # passing our "X cold brew" queries returns nothing from Flipp's API.
     req_tasks.append(("search_flipp(brands)", lambda: search_flipp()))
